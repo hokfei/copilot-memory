@@ -1,0 +1,23 @@
+{
+  "name": "memory",
+  "version": "0.1.0",
+  "description": "Local, private global memory for the Copilot app (remember/recall/forget)",
+  "type": "module",
+  "license": "MIT",
+  "author": "hokfei",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/hokfei/copilot-memory.git"
+  },
+  "engines": { "node": ">=22.5.0" },
+  "scripts": {
+    "backfill": "node scripts/backfill.mjs",
+    "test": "node scripts/test-memory.mjs"
+  },
+  "dependencies": {
+    "node-llama-cpp": "^3.22.2"
+  },
+  "allowScripts": {
+    "node-llama-cpp@3.22.2": true
+  }
+}
