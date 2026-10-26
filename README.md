@@ -106,6 +106,36 @@ embedder and chat model are never resident at the same time (mutual
 | `consolidate_memories` | On-demand LLM pass: dedupe, merge near-duplicates, flag contradictions. |
 | `bootstrap_instructions` | Draft a muse-instructions.md from project memories + top session hits. Text only — never writes into repos. |
 
+## Session-start preload
+
+The extension registers an `onSessionStart` hook that injects a capped block
+of known facts, so the agent never has to remember to call recall:
+
+```
+Known about <owner/repo>:
+- fact (+)
+General working context:
+- fact
+```
+
+- Selection: active (non-superseded) rows where scope is `global` or matches
+  the current repo. Pinned first, then repo-scoped before global, then higher
+  `confirmed` count, then newest. Events are excluded unless pinned.
+- Budget: `MAX_INJECT_CHARS` (3500), header included; a line that doesn't fit
+  is skipped so one long fact can't shut out shorter ones behind it. `(+)`
+  marks rows with detail — fetch it with `recall_memory`. The footer tells the
+  model how many in-scope rows were withheld.
+- Repo resolution: walks up from the session working directory to `.git`; in
+  app worktrees `.git` is a file (`gitdir: <path>`), followed up to the shared
+  config, whose `url = ...` parses to `owner/repo` (scope `project:<owner/repo>`).
+  Falls back to the directory basename — facts learned in one worktree apply in
+  every checkout of the same repo.
+- Safety: the hook body never throws, reads sqlite only, and never loads
+  node-llama-cpp on this path (~1ms). Hosts without hook support fall back to
+  tools-only registration; transient join failures retry on backoff.
+- One line per hook run is appended to `hook-audit.log` (timestamp, cwd, repo,
+  injected, withheld, chars) — the only way to know whether a host ran the hook.
+
 ## Backfill (one-time, approval-gated)
 
 ```bash
@@ -137,13 +167,15 @@ lib/paths.mjs          path resolution (relative, no hardcoded usernames)
 lib/read.mjs           read-only session store readers (copied from session-search)
 lib/chunk.mjs          sliding-window chunking + keying/hashing (copied)
 lib/embed.mjs          local embedding, model path from env (copied + repointed)
+lib/preload.mjs         session-start hook: repo resolution, selection, budget, join fallback
 lib/store.mjs          sqlite memories + vectors (content-hash upsert, pinned, scope caps)
 lib/search.mjs         brute-force dot-product search + per-scope cap
 lib/vectors.mjs        fill missing vectors (shared by recall, forget)
 lib/synthesize.mjs     lazy Qwen3.5-4B chat context, budgeted prompts
 scripts/backfill.mjs   one-time history extraction into staging.json
 scripts/test-memory.mjs    self-consistency tests (throwaway DB)
-memory.db              memories (generated, gitignored)
+memory.db              memories (+ -wal/-shm under WAL, generated, gitignored)
+hook-audit.log         one line per session-start hook run (generated, gitignored)
 staging.json           backfill candidates awaiting approval (generated)
 ```
 

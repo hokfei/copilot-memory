@@ -4,4 +4,5 @@ memory.db-journal
 memory.db-wal
 memory.db-shm
 staging.json
+hook-audit.log
 .test-memory.db*
