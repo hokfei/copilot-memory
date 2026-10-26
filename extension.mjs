@@ -1,6 +1,7 @@
 import { joinSession } from "@github/copilot-sdk/extension";
 import { embedQuery, embedDocuments } from "./lib/embed.mjs";
 import { loadScoredMemories } from "./lib/vectors.mjs";
+import { looksSecret, headlineTooLong, HEADLINE_CAP } from "./lib/quality.mjs";
 import { memoryDbPath } from "./lib/paths.mjs";
 import {
   openDb,
@@ -28,7 +29,9 @@ import {
 function formatMemory(m) {
   const tags = m.tags.length > 0 ? ` [${m.tags.join(", ")}]` : "";
   const pin = m.pinned ? " 📌" : "";
-  return `(${m.id}) [${m.scope}]${tags}${pin}\n${m.text}`;
+  const kind = m.kind === "event" ? " [event]" : "";
+  const detail = m.detail ? `\nDetails: ${m.detail}` : "";
+  return `(${m.id}) [${m.scope}]${tags}${pin}${kind}\n${m.text}${detail}`;
 }
 
 const session = await joinSession({
@@ -36,11 +39,22 @@ const session = await joinSession({
     {
       name: "remember_memory",
       description:
-        "Save a fact, preference, decision, or note to long-term memory. Scope defaults to global; use project:<name> for project-specific memories. Re-remembering the same text refreshes the existing entry instead of duplicating it.",
+        "Save a durable fact to long-term memory — only what will still be true in six months " +
+        "(conventions, environments, decisions, ownership, recurring pitfalls). Do NOT store " +
+        "progress/task/review status, branch names, credentials, or anything readable from the repo. " +
+        "Headline `text` is capped at 300 chars; put reasons, examples, and evidence in `detail` " +
+        "(searchable and returned by recall, never preloaded). Past changes are auto-classified " +
+        "as events and stay searchable but out of the preload. Secrets are rejected. " +
+        "Scope defaults to global; use project:<name> for project-specific memories. " +
+        "Re-remembering the same text refreshes the existing entry instead of duplicating it.",
       parameters: {
         type: "object",
         properties: {
-          text: { type: "string", description: "The fact or note to remember." },
+          text: { type: "string", description: "Headline fact, max 300 chars. Reasons/evidence go in detail." },
+          detail: {
+            type: "string",
+            description: "Optional longer context: reasons, examples, evidence. Searchable and returned by recall_memory, never preloaded.",
+          },
           scope: {
             type: "string",
             description: "Memory scope: 'global' or 'project:<name>'. Default 'global'.",
@@ -60,6 +74,13 @@ const session = await joinSession({
       handler: async (args) => {
         const text = (args.text || "").trim();
         if (!text) return "Give a non-empty text to remember.";
+        const detail = typeof args.detail === "string" ? args.detail.trim() : "";
+        if (looksSecret(text) || (detail && looksSecret(detail))) {
+          return "Refused: text looks like it contains a secret (password, token, key, credential, or credentialed connection string). Never store secrets in memory.";
+        }
+        if (headlineTooLong(text)) {
+          return `Refused: headline is ${text.length} chars (cap ${HEADLINE_CAP}). Shorten the headline and move reasons/examples/evidence into detail.`;
+        }
         const scope = normalizeScope(args.scope);
         if (!isValidScope(scope)) {
           return `Invalid scope '${args.scope}'. Use 'global' or 'project:<name>'.`;
@@ -75,6 +96,7 @@ const session = await joinSession({
             scope,
             tags,
             pin: args.pin ?? null,
+            detail: detail || null,
           });
           insertVector(db, id, vec);
           if (created) {
