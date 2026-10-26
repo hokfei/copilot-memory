@@ -75,6 +75,55 @@ try {
     check("empty query is null", findNearDuplicate("a an of", [{ id: "a", text: "we run postgres in prod" }]) === null);
     check("no candidates is null", findNearDuplicate("we run postgres in prod", []) === null);
   }
+
+  // Preload: repo resolution, selection order, budget honesty (no model).
+  {
+    const { resolveRepo, repoScope, selectPreloadRows, renderPreload, buildPreload, MAX_INJECT_CHARS } =
+      await import("../lib/preload.mjs");
+    const { mkdtempSync, mkdirSync, writeFileSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join: joinP, basename: baseP } = await import("node:path");
+    const root = mkdtempSync(joinP(tmpdir(), "preload-"));
+    mkdirSync(joinP(root, ".git"));
+    writeFileSync(joinP(root, ".git", "config"), '[remote "origin"]\n\turl = git@github.com:hokfei/copilot-memory.git\n');
+    mkdirSync(joinP(root, "sub", "dir"), { recursive: true });
+    check("resolveRepo finds repo from subdir", resolveRepo(joinP(root, "sub", "dir")).repo === "hokfei/copilot-memory");
+    mkdirSync(joinP(root, ".git", "worktrees", "wt"), { recursive: true });
+    const wt = mkdtempSync(joinP(tmpdir(), "preload-wt-"));
+    writeFileSync(joinP(wt, ".git"), `gitdir: ${joinP(root, ".git", "worktrees", "wt")}\n`);
+    check("resolveRepo follows worktree gitdir", resolveRepo(wt).repo === "hokfei/copilot-memory");
+    const plain = mkdtempSync(joinP(tmpdir(), "preload-plain-"));
+    check("resolveRepo falls back to basename", resolveRepo(plain).repo === baseP(plain));
+    check("repoScope lowercases", repoScope("HokFei/Copilot-Memory") === "project:hokfei/copilot-memory");
+
+    const scope = repoScope("hokfei/copilot-memory");
+    const p0 = upsertMemory(db, { text: "preload ordinary global standing fact", scope: "global", tags: [] });
+    const p1 = upsertMemory(db, { text: "preload pinned global standing truth", scope: "global", tags: [] });
+    setPinned(db, p1.id, true);
+    const p2 = upsertMemory(db, { text: "preload repo standing fact recorded", scope, tags: [], detail: "recorded for reasons" });
+    const p3 = upsertMemory(db, { text: "the old script was replaced with polymer clay", scope, tags: [] });
+    const p4 = upsertMemory(db, { text: "the old pipeline was migrated to new runners", scope: "global", tags: [] });
+    setPinned(db, p4.id, true);
+    const sel = selectPreloadRows(db, scope).map((r) => r.id);
+    check("pinned first, repo before global", JSON.stringify(sel.slice(0, 4)) === JSON.stringify([p4.id, p1.id, p2.id, p0.id]), `order=${sel.slice(0, 4)}`);
+    check("event excluded unless pinned", !sel.includes(p3.id) && sel.includes(p4.id));
+    const full = buildPreload(db, "hokfei/copilot-memory");
+    check("full preload fits budget", full.text !== null && full.text.length <= MAX_INJECT_CHARS, `chars=${full.text ? full.text.length : "null"}`);
+    check("preload marks detail rows", full.text.includes(" (+)"));
+    check("preload leads with background disclaimer", full.text.startsWith("Persistent context recalled"));
+    const all = selectPreloadRows(db, scope);
+    const tight = buildPreload(db, "hokfei/copilot-memory", 550);
+    check("tight budget still fits exactly", tight.text !== null && tight.text.length <= 550, `chars=${tight.text ? tight.text.length : "null"}`);
+    check("tight budget accounts every row", tight.injected + tight.withheld === all.length, `injected=${tight.injected} withheld=${tight.withheld} total=${all.length}`);
+    const rr = renderPreload("x", [{ text: "x".repeat(200), detail: "" }], [{ text: "ok", detail: "" }], 500);
+    check(
+      "long fact skipped, shorter behind still picked",
+      rr.text !== null && rr.injected === 1 && rr.withheld === 1 && rr.text.includes("- ok") && !rr.text.includes("xxxx")
+    );
+    const none = buildPreload(db, "hokfei/copilot-memory", 10);
+    check("impossible budget returns null", none.text === null && none.injected === 0);
+    for (const r of [p0, p1, p2, p3, p4]) deleteMemory(db, r.id);
+  }
   {
     const { classifyKind, looksSecret, headlineTooLong, HEADLINE_CAP } = await import("../lib/quality.mjs");
     check("classifies standing truth as state", classifyKind("I prefer TypeScript with strict mode") === "state");
