@@ -1,5 +1,10 @@
 node_modules/
 memory.db
 memory.db-journal
+memory.db-wal
+memory.db-shm
 staging.json
+mined.json
+mined-staging.json
+hook-audit.log
 .test-memory.db*

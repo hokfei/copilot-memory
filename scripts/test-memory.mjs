@@ -43,7 +43,175 @@ const db = openDb(testDb);
 try {
   check("fresh db is empty", countMemories(db) === 0);
 
-  // Pure checks (no model needed): dims validation + secret exclusion.
+  // Near-duplicate similarity (pure token math, no model needed).
+  // NOTE: idf is measured over the candidate set, so single-candidate toy
+  // cases underweight shared words; realistic tests use multi-row sets with
+  // shared boilerplate, exactly how the remember path calls it.
+  {
+    const { tokenize, findNearDuplicate, SIMILARITY_THRESHOLD } = await import("../lib/similarity.mjs");
+    check("tokenize filters short words", JSON.stringify(tokenize("We run Postgres 14 in prod!")) === JSON.stringify(["postgres", "prod"]));
+    check("identical texts score 1", findNearDuplicate("we run postgres in prod", [{ id: "a", text: "we run postgres in prod" }]).score === 1);
+    check("disjoint texts score null", findNearDuplicate("penguins huddle in winter", [{ id: "a", text: "we run postgres in prod" }]) === null);
+    const boilerplate = [
+      { id: "a", text: "production postgres database runs version fourteen with nightly backups" },
+      { id: "b", text: "production postgres database stores weekly reports for analytics" },
+      { id: "c", text: "production postgres database cleans temp tables every sunday" },
+    ];
+    const para = findNearDuplicate("production postgres database runs version fourteen with weekly backups", boilerplate);
+    check("close paraphrase picks right row", para !== null && para.id === "a", `got=${para ? para.id + "@" + para.score.toFixed(3) : "none"}`);
+    const contra = findNearDuplicate(
+      "production deploy runs every Tuesday morning with full backup",
+      [
+        { id: "a", text: "production deploy runs every Thursday morning with full backup" },
+        { id: "b", text: "production deploy validates config before starting services" },
+        { id: "c", text: "production deploy notifies the team after finishing migrations" },
+      ]
+    );
+    check("contradiction supersedes", contra !== null && contra.id === "a" && contra.score >= SIMILARITY_THRESHOLD, `got=${contra ? contra.id + "@" + contra.score.toFixed(3) : "none"}`);
+    const swallow = findNearDuplicate("postgres prod", [
+      { id: "a", text: "postgres prod windows scheduled task nightly backup rotation policy quarterly review" },
+    ]);
+    check("short fact not swallowed by long one", swallow === null, `score=${swallow ? swallow.score.toFixed(3) : "none"}`);
+    check("empty query is null", findNearDuplicate("a an of", [{ id: "a", text: "we run postgres in prod" }]) === null);
+    check("no candidates is null", findNearDuplicate("we run postgres in prod", []) === null);
+  }
+
+  // Miner core: reader, parser, full gate (pure, no model).
+  {
+    const { readCheckpoints, parseExtraction, minerGate, extractionPrompt, EXTRACTION_EXAMPLES } =
+      await import("../lib/miner.mjs");
+    check("reader handles missing store", readCheckpoints("C:/no/such/store.db").length === 0);
+    const { DatabaseSync: DB } = await import("node:sqlite");
+    const { join: joinP } = await import("node:path");
+    const fxDb = joinP(extRoot, ".test-checkpoints.db");
+    rmSync(fxDb, { force: true });
+    {
+      const fx = new DB(fxDb);
+      fx.exec("CREATE TABLE checkpoints (id INTEGER PRIMARY KEY, session_id TEXT, checkpoint_number INTEGER, title TEXT, overview TEXT, history TEXT, work_done TEXT, technical_details TEXT, important_files TEXT, next_steps TEXT, created_at TEXT)");
+      fx.prepare("INSERT INTO checkpoints (session_id, checkpoint_number, title, overview, history, work_done, technical_details) VALUES (?,?,?,?,?,?,?)").run("s1", 1, "t", "ov", "hi", "wd", "td");
+      fx.prepare("INSERT INTO checkpoints (session_id, checkpoint_number, title, overview, history, work_done, technical_details) VALUES (?,?,?,?,?,?,?)").run("s1", 2, "t2", "", "", "only work", "");
+      fx.close();
+    }
+    const cps = readCheckpoints(fxDb);
+    check("reader returns checkpoints oldest-first", cps.length === 2 && cps[0].number === 1 && cps[1].text === "only work");
+    rmSync(fxDb, { force: true });
+    const good = parseExtraction('[{"text": "Production deploys run on Thursdays", "confidence": 0.9, "tags": ["workflow"]}]');
+    check("parser accepts valid array", good.candidates.length === 1 && good.errors.length === 0 && good.candidates[0].confidence === 0.9);
+    check("parser rejects prose", parseExtraction("no json here").errors.length === 1);
+    check("parser flags missing text", parseExtraction("[{}]").errors.length === 1);
+    const prompt = extractionPrompt("some checkpoint");
+    check("prompt embeds good examples", EXTRACTION_EXAMPLES.every((e) => prompt.includes(e)));
+    const gate = (t, c = 0.9, d = "") => minerGate({ text: t, detail: d, confidence: c }, prompt);
+    check("gate passes durable fact", gate("Production incidents page the on-call engineer within five minutes") === null);
+    check("gate rejects short", gate("Too short") !== null);
+    check("gate rejects long", gate("x".repeat(201)) !== null);
+    check("gate rejects low confidence", gate("Production deploys run on Thursdays with a staging gate", 0.5) !== null);
+    check("gate rejects missing confidence", minerGate({ text: "Production deploys run on Thursdays with a staging gate" }, prompt) !== null);
+    check("gate rejects secret", gate("The deploy api key is sk-live-123 for production use") !== null);
+    check("gate rejects transient status", gate("The migration to pnpm is complete and shipped yesterday") !== null);
+    check("gate rejects in-progress", gate("We are currently implementing the new deploy pipeline") !== null);
+    check("gate rejects branch talk", gate("The fix is on branch feat/deploy-pipeline for review") !== null);
+    check("gate rejects narrative", gate("We worked on the deploy pipeline and fixed several bugs") !== null);
+    check("gate rejects dangling subject", gate("The project uses pnpm for package management tasks") !== null);
+    check("gate rejects prompt echo", gate(EXTRACTION_EXAMPLES[0]) !== null);
+  }
+
+  // Preload: repo resolution, selection order, budget honesty (no model).
+  {
+    const { resolveRepo, repoScope, selectPreloadRows, renderPreload, buildPreload, joinWithFallback, MAX_INJECT_CHARS } =
+      await import("../lib/preload.mjs");
+    const { mkdtempSync, mkdirSync, writeFileSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join: joinP, basename: baseP } = await import("node:path");
+    const root = mkdtempSync(joinP(tmpdir(), "preload-"));
+    mkdirSync(joinP(root, ".git"));
+    writeFileSync(joinP(root, ".git", "config"), '[remote "origin"]\n\turl = git@github.com:hokfei/copilot-memory.git\n');
+    mkdirSync(joinP(root, "sub", "dir"), { recursive: true });
+    check("resolveRepo finds repo from subdir", resolveRepo(joinP(root, "sub", "dir")).repo === "hokfei/copilot-memory");
+    mkdirSync(joinP(root, ".git", "worktrees", "wt"), { recursive: true });
+    const wt = mkdtempSync(joinP(tmpdir(), "preload-wt-"));
+    writeFileSync(joinP(wt, ".git"), `gitdir: ${joinP(root, ".git", "worktrees", "wt")}\n`);
+    check("resolveRepo follows worktree gitdir", resolveRepo(wt).repo === "hokfei/copilot-memory");
+    const plain = mkdtempSync(joinP(tmpdir(), "preload-plain-"));
+    check("resolveRepo falls back to basename", resolveRepo(plain).repo === baseP(plain));
+    check("repoScope lowercases", repoScope("HokFei/Copilot-Memory") === "project:hokfei/copilot-memory");
+
+    const scope = repoScope("hokfei/copilot-memory");
+    const p0 = upsertMemory(db, { text: "preload ordinary global standing fact", scope: "global", tags: [] });
+    const p1 = upsertMemory(db, { text: "preload pinned global standing truth", scope: "global", tags: [] });
+    setPinned(db, p1.id, true);
+    const p2 = upsertMemory(db, { text: "preload repo standing fact recorded", scope, tags: [], detail: "recorded for reasons" });
+    const p3 = upsertMemory(db, { text: "the old script was replaced with polymer clay", scope, tags: [] });
+    const p4 = upsertMemory(db, { text: "the old pipeline was migrated to new runners", scope: "global", tags: [] });
+    setPinned(db, p4.id, true);
+    const sel = selectPreloadRows(db, scope).map((r) => r.id);
+    check("pinned first, repo before global", JSON.stringify(sel.slice(0, 4)) === JSON.stringify([p4.id, p1.id, p2.id, p0.id]), `order=${sel.slice(0, 4)}`);
+    check("event excluded unless pinned", !sel.includes(p3.id) && sel.includes(p4.id));
+    const full = buildPreload(db, "hokfei/copilot-memory");
+    check("full preload fits budget", full.text !== null && full.text.length <= MAX_INJECT_CHARS, `chars=${full.text ? full.text.length : "null"}`);
+    check("preload marks detail rows", full.text.includes(" (+)"));
+    check("preload leads with background disclaimer", full.text.startsWith("Persistent context recalled"));
+    const all = selectPreloadRows(db, scope);
+    const tight = buildPreload(db, "hokfei/copilot-memory", 550);
+    check("tight budget still fits exactly", tight.text !== null && tight.text.length <= 550, `chars=${tight.text ? tight.text.length : "null"}`);
+    check("tight budget accounts every row", tight.injected + tight.withheld === all.length, `injected=${tight.injected} withheld=${tight.withheld} total=${all.length}`);
+    const rr = renderPreload("x", [{ text: "x".repeat(200), detail: "" }], [{ text: "ok", detail: "" }], 500);
+    check(
+      "long fact skipped, shorter behind still picked",
+      rr.text !== null && rr.injected === 1 && rr.withheld === 1 && rr.text.includes("- ok") && !rr.text.includes("xxxx")
+    );
+    const hookCalls = [];
+    const fellBack = await joinWithFallback(
+      async (cfg) => {
+        hookCalls.push(!!cfg.hooks);
+        if (cfg.hooks) throw new Error("Hook processor is not configured for this host");
+        return "session";
+      },
+      { tools: [] },
+      { onSessionStart: async () => {} }
+    );
+    check("hook-processor error falls back to tools-only", fellBack === "session" && JSON.stringify(hookCalls) === "[true,false]");
+    const t0 = Date.now();
+    let tries = 0;
+    const retried = await joinWithFallback(
+      async () => {
+        tries++;
+        if (tries === 1) throw new Error("socket hang up");
+        return "s2";
+      },
+      {},
+      {}
+    );
+    check("transient failure retried", retried === "s2" && tries === 2 && Date.now() - t0 >= 900);
+    let threw = null;
+    try {
+      await joinWithFallback(async () => { throw new Error("permanent boom"); }, {}, {});
+    } catch (e) {
+      threw = e;
+    }
+    check("non-transient error rethrown", threw !== null && threw.message === "permanent boom");
+    const none = buildPreload(db, "hokfei/copilot-memory", 10);
+    check("impossible budget returns null", none.text === null && none.injected === 0);
+    for (const r of [p0, p1, p2, p3, p4]) deleteMemory(db, r.id);
+  }
+  {
+    const { classifyKind, looksSecret, headlineTooLong, HEADLINE_CAP } = await import("../lib/quality.mjs");
+    check("classifies standing truth as state", classifyKind("I prefer TypeScript with strict mode") === "state");
+    check("classifies past change as event (was fixed)", classifyKind("The retry bug was fixed in the deploy script") === "event");
+    check("classifies past change as event (has been)", classifyKind("The pipeline has been validated end to end") === "event");
+    check("classifies past change as event (now returns)", classifyKind("The endpoint now returns JSON errors") === "event");
+    check("classifies past change as event (have switched)", classifyKind("We have switched to pnpm") === "event");
+    check("self-report does not override structure", classifyKind("STATE FACT: the deploy was migrated to Docker") === "event");
+    check("rejects api key", looksSecret("the api key for staging is sk-abc123") === true);
+    check("rejects password", looksSecret("my password for the deploy user is hunter2") === true);
+    check("rejects bearer token", looksSecret("use bearer abc.def.ghi for auth") === true);
+    check("rejects credential connection string", looksSecret("postgres://admin:s3cret@db:5432/app") === true);
+    check("rejects PEM block", looksSecret("key: -----BEGIN RSA PRIVATE KEY----- ...") === true);
+    check("allows endpoint docs", looksSecret("the api endpoint uses REST conventions") === false);
+    check("allows plural token prose", looksSecret("we use OAuth tokens for CI") === false);
+    check("headline cap boundary", HEADLINE_CAP === 300 && headlineTooLong("x".repeat(300)) === false);
+    check("headline over cap", headlineTooLong("x".repeat(301)) === true);
+  }
   {
     const q = new Float32Array([1, 0, 0]);
     check("dims match returns null", dimsMismatch([{ vector: new Float32Array([0, 1, 0]) }], q) === null);
@@ -205,6 +373,129 @@ try {
     migDb.close();
     rmSync(legacyDb, { force: true });
   }
+
+  // kind/detail: structural auto-classification, round-trip, migration.
+  const { loadScoredMemories: loadKind, dropVectorCache: dropKindCache } = await import("../lib/vectors.mjs");
+  const evId = upsertMemory(db, { text: "the old endpoint was replaced with REST", scope: "global", tags: [] }).id;
+  check("event auto-classified", getMemory(db, evId).kind === "event");
+  check("state auto-classified", getMemory(db, ids[0]).kind === "state");
+  const detId = upsertMemory(db, { text: "detail round trip probe", scope: "global", tags: [], detail: "because reasons" }).id;
+  check("detail stored", getMemory(db, detId).detail === "because reasons");
+  upsertMemory(db, { text: "detail round trip probe", scope: "global", tags: [] });
+  check("detail kept on refresh", getMemory(db, detId).detail === "because reasons");
+  upsertMemory(db, { text: "detail round trip probe", scope: "global", tags: [], detail: "new reasons" });
+  check("detail replaced when given", getMemory(db, detId).detail === "new reasons");
+  check("detail defaults empty", getMemory(db, ids[0]).detail === "");
+  dropKindCache(testDb);
+  const withKind = await loadKind(db, testDb);
+  const evRow = withKind.find((m) => m.id === evId);
+  check(
+    "loader carries kind/detail",
+    evRow && evRow.kind === "event" && withKind.find((m) => m.id === detId).detail === "new reasons"
+  );
+  deleteMemory(db, evId);
+  deleteMemory(db, detId);
+  dropKindCache(testDb);
+
+  // Migration: original schema (no pinned/kind/detail) gains all three.
+  const legacyDb2 = testDb + ".legacy2";
+  rmSync(legacyDb2, { force: true });
+  {
+    const { DatabaseSync } = await import("node:sqlite");
+    const raw = new DatabaseSync(legacyDb2);
+    raw.exec(
+      "CREATE TABLE memories (id TEXT PRIMARY KEY, text TEXT NOT NULL, scope TEXT NOT NULL DEFAULT 'global', tags TEXT NOT NULL DEFAULT '[]', source_session TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL); CREATE TABLE memory_vectors (id TEXT PRIMARY KEY, vector BLOB NOT NULL);"
+    );
+    raw.close();
+  }
+  const migDb2 = openDb(legacyDb2);
+  try {
+    const { id } = upsertMemory(migDb2, { text: "the cache was migrated to disk", scope: "global", tags: [] });
+    const m = getMemory(migDb2, id);
+    check("original schema migrates kind/detail", m.kind === "event" && m.detail === "" && m.pinned === false);
+  } finally {
+    migDb2.close();
+    rmSync(legacyDb2, { force: true });
+  }
+
+  // Supersession: paraphrase retires, pin carries, scope isolates, repeats confirm.
+  dropKindCache(testDb);
+  const s1 = upsertMemory(db, { text: "production postgres database runs version fourteen with nightly backups", scope: "global", tags: [] });
+  insertVector(db, s1.id, [1, 0]);
+  check("supersede setup created", s1.created === true);
+  const s2 = upsertMemory(db, { text: "production postgres database runs version fourteen with weekly backups", scope: "global", tags: [] });
+  insertVector(db, s2.id, [0, 1]);
+  const { applySupersession } = await import("../lib/store.mjs");
+  const hit = applySupersession(db, s2.id, "production postgres database runs version fourteen with weekly backups", "global");
+  check("paraphrase supersedes", hit !== null && hit.supersededId === s1.id, `got=${hit ? hit.supersededId + "@" + hit.score.toFixed(3) : "none"}`);
+  check("old row retired with pointer", getMemory(db, s1.id).superseded_by === s2.id);
+  check("new row records supersedes", getMemory(db, s2.id).supersedes === s1.id);
+  check("retired hidden from list", listMemories(db, {}).every((m) => m.id !== s1.id));
+  check("retired hidden from vectors", getAllVectors(db).every((r) => r.id !== s1.id));
+  dropKindCache(testDb);
+  check("retired hidden from loader", (await loadKind(db, testDb)).every((m) => m.id !== s1.id));
+  const s3 = upsertMemory(db, { text: "emperor penguins migrate across antarctic ice shelves yearly", scope: "global", tags: [] });
+  insertVector(db, s3.id, [1, 1]);
+  check("unrelated does not supersede", applySupersession(db, s3.id, "emperor penguins migrate across antarctic ice shelves yearly", "global") === null);
+  // Same text in another scope refreshes the one global-keyed entry (no duplicate);
+  // cross-scope paraphrases must match within their own scope only.
+  const o1 = upsertMemory(db, { text: "staging postgres database runs version fourteen with nightly backups", scope: "project:other", tags: [] });
+  insertVector(db, o1.id, [1, 0]);
+  const o2 = upsertMemory(db, { text: "staging postgres database runs version fourteen with weekly backups", scope: "project:other", tags: [] });
+  insertVector(db, o2.id, [0, 1]);
+  const hitO = applySupersession(db, o2.id, "staging postgres database runs version fourteen with weekly backups", "project:other");
+  check("supersession stays within scope", hitO !== null && hitO.supersededId === o1.id, `got=${hitO ? hitO.supersededId : "none"}`);
+  check("global rows untouched by other-scope retire", getMemory(db, s2.id).superseded_by === null);
+  setPinned(db, s2.id, true);
+  const s5 = upsertMemory(db, { text: "production postgres database runs version fourteen with monthly backups", scope: "global", tags: [] });
+  insertVector(db, s5.id, [1, 0]);
+  const hit2 = applySupersession(db, s5.id, "production postgres database runs version fourteen with monthly backups", "global");
+  check("pin carries to superseding row", hit2 !== null && getMemory(db, s5.id).pinned === true, `got=${hit2 ? hit2.supersededId : "none"}`);
+  const before = getMemory(db, s5.id).confirmed | 0;
+  upsertMemory(db, { text: "production postgres database runs version fourteen with monthly backups", scope: "global", tags: [] });
+  check("identical repeat bumps confirmed", (getMemory(db, s5.id).confirmed | 0) === before + 1);
+  for (const id of [s1.id, s2.id, s3.id, o1.id, o2.id, s5.id]) deleteMemory(db, id);
+  dropKindCache(testDb);
+
+  // WAL + single-JOIN loader: parity, scope filter, cache, invalidation.
+  check("journal mode is WAL", db.prepare("PRAGMA journal_mode").get().journal_mode === "wal");
+  const { loadScoredMemories, dropVectorCache } = await import("../lib/vectors.mjs");
+  dropVectorCache(testDb);
+  const loaded = await loadScoredMemories(db, testDb);
+  check("loader returns all rows", loaded.length === countMemories(db), `got=${loaded.length}`);
+  check(
+    "loader vectors decoded",
+    loaded.every((m) => m.vector instanceof Float32Array && m.vector.length === vecs[0].length)
+  );
+  const loadedScoped = await loadScoredMemories(db, testDb, "project:webapp");
+  check("loader scope filter", loadedScoped.length === 1 && loadedScoped[0].id === ids[1], `got=${loadedScoped.length}`);
+  const parity = getAllVectors(db).map((r) => ({ ...getMemory(db, r.id), vector: r.vector }));
+  const byId = new Map(loaded.map((m) => [m.id, m]));
+  check(
+    "loader parity with per-row path",
+    parity.every((p) => {
+      const l = byId.get(p.id);
+      return (
+        l && l.text === p.text && l.scope === p.scope && l.pinned === p.pinned &&
+        l.vector.length === p.vector.length && l.vector.every((v, i) => v === p.vector[i])
+      );
+    })
+  );
+  const again = await loadScoredMemories(db, testDb);
+  check("cache hit returns same rows", again === loaded);
+  // Simulate a parallel session's write through a second connection.
+  const db2 = openDb(testDb);
+  try {
+    const { id: nid } = upsertMemory(db2, { text: "parallel session probe entry", scope: "global", tags: [] });
+    insertVector(db2, nid, Array.from(vecs[0]));
+  } finally {
+    db2.close();
+  }
+  const after = await loadScoredMemories(db, testDb);
+  check("cache invalidates on external write", after.length === loaded.length + 1, `got=${after.length}`);
+  check("cache refreshes reference", after !== loaded);
+  deleteMemory(db, memoryIdFor("parallel session probe entry"));
+  dropVectorCache(testDb);
 } finally {
   db.close();
   rmSync(testDb, { force: true });

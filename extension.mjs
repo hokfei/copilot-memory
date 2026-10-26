@@ -1,18 +1,22 @@
 import { joinSession } from "@github/copilot-sdk/extension";
+import { basename } from "node:path";
 import { embedQuery, embedDocuments } from "./lib/embed.mjs";
-import { fillMissingVectors } from "./lib/vectors.mjs";
+import { loadScoredMemories } from "./lib/vectors.mjs";
+import { looksSecret, headlineTooLong, HEADLINE_CAP } from "./lib/quality.mjs";
+import { resolveRepo, repoScope, buildPreload, auditHook, joinWithFallback, MAX_INJECT_CHARS } from "./lib/preload.mjs";
+import { memoryDbPath, hookAuditPath } from "./lib/paths.mjs";
 import {
   openDb,
   normalizeScope,
   isValidScope,
   upsertMemory,
+  applySupersession,
   memoryIdFor,
   getMemory,
   insertVector,
   deleteMemory,
   updateMemoryMeta,
   setPinned,
-  parseTags,
   enforceScopeCap,
   DEFAULT_SCOPE_CAP,
   listMemories,
@@ -28,19 +32,33 @@ import {
 function formatMemory(m) {
   const tags = m.tags.length > 0 ? ` [${m.tags.join(", ")}]` : "";
   const pin = m.pinned ? " 📌" : "";
-  return `(${m.id}) [${m.scope}]${tags}${pin}\n${m.text}`;
+  const kind = m.kind === "event" ? " [event]" : "";
+  const conf = (m.confirmed | 0) > 1 ? ` (×${m.confirmed})` : "";
+  const detail = m.detail ? `\nDetails: ${m.detail}` : "";
+  return `(${m.id}) [${m.scope}]${tags}${pin}${kind}${conf}\n${m.text}${detail}`;
 }
 
-const session = await joinSession({
+const session = await joinWithFallback(joinSession, {
   tools: [
     {
-      name: "remember",
+      name: "remember_memory",
       description:
-        "Save a fact, preference, decision, or note to long-term memory. Scope defaults to global; use project:<name> for project-specific memories. Re-remembering the same text refreshes the existing entry instead of duplicating it.",
+        "Save a durable fact to long-term memory — only what will still be true in six months " +
+        "(conventions, environments, decisions, ownership, recurring pitfalls). Do NOT store " +
+        "progress/task/review status, branch names, credentials, or anything readable from the repo. " +
+        "Headline `text` is capped at 300 chars; put reasons, examples, and evidence in `detail` " +
+        "(searchable and returned by recall, never preloaded). Past changes are auto-classified " +
+        "as events and stay searchable but out of the preload. Secrets are rejected. " +
+        "Scope defaults to global; use project:<name> for project-specific memories. " +
+        "Re-remembering the same text refreshes the existing entry instead of duplicating it.",
       parameters: {
         type: "object",
         properties: {
-          text: { type: "string", description: "The fact or note to remember." },
+          text: { type: "string", description: "Headline fact, max 300 chars. Reasons/evidence go in detail." },
+          detail: {
+            type: "string",
+            description: "Optional longer context: reasons, examples, evidence. Searchable and returned by recall_memory, never preloaded.",
+          },
           scope: {
             type: "string",
             description: "Memory scope: 'global' or 'project:<name>'. Default 'global'.",
@@ -60,6 +78,13 @@ const session = await joinSession({
       handler: async (args) => {
         const text = (args.text || "").trim();
         if (!text) return "Give a non-empty text to remember.";
+        const detail = typeof args.detail === "string" ? args.detail.trim() : "";
+        if (looksSecret(text) || (detail && looksSecret(detail))) {
+          return "Refused: text looks like it contains a secret (password, token, key, credential, or credentialed connection string). Never store secrets in memory.";
+        }
+        if (headlineTooLong(text)) {
+          return `Refused: headline is ${text.length} chars (cap ${HEADLINE_CAP}). Shorten the headline and move reasons/examples/evidence into detail.`;
+        }
         const scope = normalizeScope(args.scope);
         if (!isValidScope(scope)) {
           return `Invalid scope '${args.scope}'. Use 'global' or 'project:<name>'.`;
@@ -75,21 +100,27 @@ const session = await joinSession({
             scope,
             tags,
             pin: args.pin ?? null,
+            detail: detail || null,
           });
           insertVector(db, id, vec);
-          if (created) {
-            const evicted = enforceScopeCap(db, scope, DEFAULT_SCOPE_CAP);
-            const note = evicted > 0 ? ` (evicted ${evicted} oldest unpinned entr${evicted === 1 ? "y" : "ies"} over the ${DEFAULT_SCOPE_CAP}/scope cap)` : "";
-            return `Remembered (${id}) [${scope}]${args.pin ? " 📌" : ""}.${note}`;
+          if (!created) {
+            const conf = getMemory(db, id)?.confirmed ?? 1;
+            return `Confirmed existing memory (${id}) [${scope}] — recorded ${conf} time${conf === 1 ? "" : "s"}; no duplicate created.`;
           }
-          return `Refreshed existing memory (${id}) [${scope}] — no duplicate created.`;
+          const sup = applySupersession(db, id, text, scope);
+          const supNote = sup
+            ? ` Superseded near-duplicate (${sup.supersededId}, similarity ${sup.score.toFixed(2)}).`
+            : "";
+          const evicted = enforceScopeCap(db, scope, DEFAULT_SCOPE_CAP);
+          const note = evicted > 0 ? ` (evicted ${evicted} oldest unpinned entr${evicted === 1 ? "y" : "ies"} over the ${DEFAULT_SCOPE_CAP}/scope cap)` : "";
+          return `Remembered (${id}) [${scope}]${args.pin ? " 📌" : ""}.${supNote}${note}`;
         } finally {
           db.close();
         }
       },
     },
     {
-      name: "recall",
+      name: "recall_memory",
       description:
         "Search long-term memories by meaning. Searches memories only — past session history stays in the session-search extension.",
       parameters: {
@@ -114,37 +145,12 @@ const session = await joinSession({
         if (!query) return "Give a non-empty query to recall memories.";
         const db = openDb();
         try {
-          if (countMemories(db) === 0) return "No memories stored yet. Use remember to save some.";
+          if (countMemories(db) === 0) return "No memories stored yet. Use remember_memory to save some.";
           const scopeFilter = args.scope ? normalizeScope(args.scope) : null;
-          const rows = db
-            .prepare(
-              scopeFilter
-                ? "SELECT * FROM memories WHERE scope = ?"
-                : "SELECT * FROM memories"
-            )
-            .all(...(scopeFilter ? [scopeFilter] : []));
-          if (rows.length === 0) {
+          const withVecs = await loadScoredMemories(db, memoryDbPath, scopeFilter);
+          if (withVecs.length === 0) {
             return `No memories in scope '${scopeFilter}'.`;
           }
-          const withVecs = rows.map((r) => {
-            const buf = db
-              .prepare("SELECT vector FROM memory_vectors WHERE id = ?")
-              .get(r.id)?.vector;
-            return {
-              id: r.id,
-              text: r.text,
-              scope: r.scope,
-              tags: parseTags(r.tags),
-                pinned: (r.pinned | 0) === 1,
-                source_session: r.source_session,
-                created_at: r.created_at,
-                updated_at: r.updated_at,
-                vector: buf
-                  ? new Float32Array(buf.buffer, buf.byteOffset, buf.byteLength / 4)
-                  : null,
-              };
-          });
-          await fillMissingVectors(db, withVecs);
           const queryVec = await embedQuery(query);
           const mismatch = dimsMismatch(withVecs, queryVec);
           if (mismatch) {
@@ -164,7 +170,7 @@ const session = await joinSession({
       },
     },
     {
-      name: "forget",
+      name: "forget_memory",
       description:
         "Delete a memory by id, or by query (deletes the single top match, only after confirmation).",
       parameters: {
@@ -190,24 +196,8 @@ const session = await joinSession({
           }
           const query = (args.query || "").trim();
           if (!query) return "Give an id or a query to forget a memory.";
-          const rows = db.prepare("SELECT * FROM memories").all();
-          if (rows.length === 0) return "No memories stored yet.";
-          const withVecs = rows.map((r) => {
-            const buf = db
-              .prepare("SELECT vector FROM memory_vectors WHERE id = ?")
-              .get(r.id)?.vector;
-            return {
-              id: r.id,
-              text: r.text,
-              scope: r.scope,
-              tags: parseTags(r.tags),
-              pinned: (r.pinned | 0) === 1,
-              vector: buf
-                ? new Float32Array(buf.buffer, buf.byteOffset, buf.byteLength / 4)
-                : null,
-            };
-          });
-          await fillMissingVectors(db, withVecs);
+          if (countMemories(db) === 0) return "No memories stored yet.";
+          const withVecs = await loadScoredMemories(db, memoryDbPath);
           const queryVec = await embedQuery(query);
           const mismatch = dimsMismatch(withVecs, queryVec);
           if (mismatch) {
@@ -216,7 +206,7 @@ const session = await joinSession({
           const [top] = searchMemories(withVecs, queryVec, 1);
           if (!top) return "No matching memories found.";
           if (args.confirm !== true) {
-            return `About to forget this memory:\n${formatMemory(top)}\nCall forget again with id '${top.id}' (or query plus confirm:true) to delete it.`;
+            return `About to forget this memory:\n${formatMemory(top)}\nCall forget_memory again with id '${top.id}' (or query plus confirm:true) to delete it.`;
           }
           deleteMemory(db, top.id);
           return `Forgot memory (${top.id}).`;
@@ -572,6 +562,48 @@ Reply schema: {"merges":[{"keep_id":"...","merge_ids":["..."],"merged_text":"...
       },
     },
   ],
-});
+  },
+  { onSessionStart }
+);
 
 await session.log("memory extension ready", { ephemeral: true });
+
+// Session-start preload: capped known-facts block, sqlite only, never throws.
+// A slow or throwing hook would surface on every session start, so the body
+// is defensive and node-llama-cpp is never loaded on this path.
+async function onSessionStart(input) {
+  const started = Date.now();
+  const cwd = (input && input.workingDirectory) || process.cwd();
+  let repo = basename(cwd);
+  let injected = 0;
+  let withheld = 0;
+  let chars = 0;
+  try {
+    repo = resolveRepo(cwd).repo;
+    const db = openDb();
+    try {
+      const built = buildPreload(db, repo, MAX_INJECT_CHARS);
+      injected = built.injected;
+      withheld = built.withheld;
+      chars = built.text ? built.text.length : 0;
+      if (built.text) return { additionalContext: built.text };
+      return;
+    } finally {
+      db.close();
+    }
+  } catch {
+    return;
+  } finally {
+    auditHook(hookAuditPath, {
+      ts: new Date().toISOString(),
+      cwd,
+      repo,
+      injected,
+      withheld,
+      chars,
+      ms: Date.now() - started,
+    });
+  }
+}
+
+// (joinWithFallback lives in lib/preload.mjs, tested with a stub joinFn.)

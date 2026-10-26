@@ -12,6 +12,9 @@
   "engines": { "node": ">=22.5.0" },
   "scripts": {
     "backfill": "node scripts/backfill.mjs",
+    "mine": "node scripts/mine.mjs",
+    "schedule-weekly": "node scripts/schedule-weekly.mjs",
+    "eval": "node scripts/eval-recall.mjs",
     "test": "node scripts/test-memory.mjs"
   },
   "dependencies": {
