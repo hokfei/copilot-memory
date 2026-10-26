@@ -78,7 +78,7 @@ try {
 
   // Preload: repo resolution, selection order, budget honesty (no model).
   {
-    const { resolveRepo, repoScope, selectPreloadRows, renderPreload, buildPreload, MAX_INJECT_CHARS } =
+    const { resolveRepo, repoScope, selectPreloadRows, renderPreload, buildPreload, joinWithFallback, MAX_INJECT_CHARS } =
       await import("../lib/preload.mjs");
     const { mkdtempSync, mkdirSync, writeFileSync } = await import("node:fs");
     const { tmpdir } = await import("node:os");
@@ -120,6 +120,36 @@ try {
       "long fact skipped, shorter behind still picked",
       rr.text !== null && rr.injected === 1 && rr.withheld === 1 && rr.text.includes("- ok") && !rr.text.includes("xxxx")
     );
+    const hookCalls = [];
+    const fellBack = await joinWithFallback(
+      async (cfg) => {
+        hookCalls.push(!!cfg.hooks);
+        if (cfg.hooks) throw new Error("Hook processor is not configured for this host");
+        return "session";
+      },
+      { tools: [] },
+      { onSessionStart: async () => {} }
+    );
+    check("hook-processor error falls back to tools-only", fellBack === "session" && JSON.stringify(hookCalls) === "[true,false]");
+    const t0 = Date.now();
+    let tries = 0;
+    const retried = await joinWithFallback(
+      async () => {
+        tries++;
+        if (tries === 1) throw new Error("socket hang up");
+        return "s2";
+      },
+      {},
+      {}
+    );
+    check("transient failure retried", retried === "s2" && tries === 2 && Date.now() - t0 >= 900);
+    let threw = null;
+    try {
+      await joinWithFallback(async () => { throw new Error("permanent boom"); }, {}, {});
+    } catch (e) {
+      threw = e;
+    }
+    check("non-transient error rethrown", threw !== null && threw.message === "permanent boom");
     const none = buildPreload(db, "hokfei/copilot-memory", 10);
     check("impossible budget returns null", none.text === null && none.injected === 0);
     for (const r of [p0, p1, p2, p3, p4]) deleteMemory(db, r.id);
