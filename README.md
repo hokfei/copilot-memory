@@ -158,6 +158,20 @@ node scripts/mine.mjs --auto-import
 npm run schedule-weekly           # OS scheduled task, weekly Sunday 03:00
 ```
 
+## Evaluation
+
+```bash
+npm run eval
+```
+
+24 questions with known-answer rows over a throwaway 16-fact store:
+12 paraphrased (embeddings should win), 12 exact-name (token overlap often
+wins), plus 4 confusable pairs with vocabulary overlap. Reports recall@3
+split by kind, per-question ranks, and session-start hook latency.
+Current: **23/24 (96%)** — paraphrase 12/12, exact 11/12; the miss is
+"Opsgenie on-call" (PagerDuty neighbor outranks it). Hook preload builds in
+~1ms over sqlite. An eval measures, it does not gate.
+
 ## Backfill (one-time, approval-gated)
 
 ```bash
@@ -197,6 +211,7 @@ lib/synthesize.mjs     lazy Qwen3.5-4B chat context, budgeted prompts
 scripts/backfill.mjs   one-time history extraction into staging.json
 scripts/mine.mjs       offline checkpoint miner (stage default, --auto-import)
 scripts/schedule-weekly.mjs  register weekly OS mining task
+scripts/eval-recall.mjs    recall@3 over 24 questions + hook latency (eval, not a gate)
 scripts/test-memory.mjs    self-consistency tests (throwaway DB)
 memory.db              memories (+ -wal/-shm under WAL, generated, gitignored)
 hook-audit.log         one line per session-start hook run (generated, gitignored)
