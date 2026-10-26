@@ -8,6 +8,7 @@ import {
   normalizeScope,
   isValidScope,
   upsertMemory,
+  applySupersession,
   memoryIdFor,
   getMemory,
   insertVector,
@@ -30,8 +31,9 @@ function formatMemory(m) {
   const tags = m.tags.length > 0 ? ` [${m.tags.join(", ")}]` : "";
   const pin = m.pinned ? " 📌" : "";
   const kind = m.kind === "event" ? " [event]" : "";
+  const conf = (m.confirmed | 0) > 1 ? ` (×${m.confirmed})` : "";
   const detail = m.detail ? `\nDetails: ${m.detail}` : "";
-  return `(${m.id}) [${m.scope}]${tags}${pin}${kind}\n${m.text}${detail}`;
+  return `(${m.id}) [${m.scope}]${tags}${pin}${kind}${conf}\n${m.text}${detail}`;
 }
 
 const session = await joinSession({
@@ -99,12 +101,17 @@ const session = await joinSession({
             detail: detail || null,
           });
           insertVector(db, id, vec);
-          if (created) {
-            const evicted = enforceScopeCap(db, scope, DEFAULT_SCOPE_CAP);
-            const note = evicted > 0 ? ` (evicted ${evicted} oldest unpinned entr${evicted === 1 ? "y" : "ies"} over the ${DEFAULT_SCOPE_CAP}/scope cap)` : "";
-            return `Remembered (${id}) [${scope}]${args.pin ? " 📌" : ""}.${note}`;
+          if (!created) {
+            const conf = getMemory(db, id)?.confirmed ?? 1;
+            return `Confirmed existing memory (${id}) [${scope}] — recorded ${conf} time${conf === 1 ? "" : "s"}; no duplicate created.`;
           }
-          return `Refreshed existing memory (${id}) [${scope}] — no duplicate created.`;
+          const sup = applySupersession(db, id, text, scope);
+          const supNote = sup
+            ? ` Superseded near-duplicate (${sup.supersededId}, similarity ${sup.score.toFixed(2)}).`
+            : "";
+          const evicted = enforceScopeCap(db, scope, DEFAULT_SCOPE_CAP);
+          const note = evicted > 0 ? ` (evicted ${evicted} oldest unpinned entr${evicted === 1 ? "y" : "ies"} over the ${DEFAULT_SCOPE_CAP}/scope cap)` : "";
+          return `Remembered (${id}) [${scope}]${args.pin ? " 📌" : ""}.${supNote}${note}`;
         } finally {
           db.close();
         }
