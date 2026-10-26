@@ -21,7 +21,7 @@ recall(query) ──embed (same QUERY_PREFIX)──▶ dot product, pinned first
 
 Memories live in `memory.db` (sqlite via `node:sqlite`):
 
-- `memories(id, text, scope, tags JSON, source_session NULL, pinned, kind, detail, created_at, updated_at)`
+- `memories(id, text, scope, tags JSON, source_session NULL, pinned, kind, detail, superseded_by NULL, supersedes NULL, confirmed, created_at, updated_at)`
 - `memory_vectors(id, vector BLOB)` — Float32, same dims as the session-search index
 
 Scope is `global` or `project:<project_id|repo>`.
@@ -45,9 +45,17 @@ Three mechanics ported from the old keyword-based `opencode-memory-plugin`
 - **Pinning**: pinned entries rank before all unpinned ones in `recall`
   (then by score) and are never auto-evicted. Set via `remember(..., pin:true)`
   or the `pin_memory` tool.
+- **Near-duplicate supersession** (beyond exact-hash dedupe): on remember,
+  the new row is compared against active rows in the SAME scope with
+  IDF-weighted Jaccard over tokens (`lib/similarity.mjs`, threshold 0.45).
+  On a hit the old row is retired (`superseded_by` = new id — kept for audit,
+  hidden from recall/list/preload/caps), pin carries forward, and the new row
+  records `supersedes`. Identical normalized text instead bumps a `confirmed`
+  counter (shown as `×N`). Unrelated facts, cross-scope paraphrases, and short
+  facts contained in long ones do not merge.
 - **Per-scope caps**: each scope holds at most `DEFAULT_SCOPE_CAP` (500)
   entries. New inserts past the cap evict the oldest **unpinned** entries
-  (by `created_at`), vectors included.
+  (by `created_at`), vectors included. Superseded rows don't count.
 
 `recall_memory`/`forget_memory` share one JOIN loader (`lib/vectors.mjs`):
 memories + vectors in a single query, decoded once, cached in memory keyed

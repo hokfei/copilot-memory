@@ -299,6 +299,45 @@ try {
     rmSync(legacyDb2, { force: true });
   }
 
+  // Supersession: paraphrase retires, pin carries, scope isolates, repeats confirm.
+  dropKindCache(testDb);
+  const s1 = upsertMemory(db, { text: "production postgres database runs version fourteen with nightly backups", scope: "global", tags: [] });
+  insertVector(db, s1.id, [1, 0]);
+  check("supersede setup created", s1.created === true);
+  const s2 = upsertMemory(db, { text: "production postgres database runs version fourteen with weekly backups", scope: "global", tags: [] });
+  insertVector(db, s2.id, [0, 1]);
+  const { applySupersession } = await import("../lib/store.mjs");
+  const hit = applySupersession(db, s2.id, "production postgres database runs version fourteen with weekly backups", "global");
+  check("paraphrase supersedes", hit !== null && hit.supersededId === s1.id, `got=${hit ? hit.supersededId + "@" + hit.score.toFixed(3) : "none"}`);
+  check("old row retired with pointer", getMemory(db, s1.id).superseded_by === s2.id);
+  check("new row records supersedes", getMemory(db, s2.id).supersedes === s1.id);
+  check("retired hidden from list", listMemories(db, {}).every((m) => m.id !== s1.id));
+  check("retired hidden from vectors", getAllVectors(db).every((r) => r.id !== s1.id));
+  dropKindCache(testDb);
+  check("retired hidden from loader", (await loadKind(db, testDb)).every((m) => m.id !== s1.id));
+  const s3 = upsertMemory(db, { text: "emperor penguins migrate across antarctic ice shelves yearly", scope: "global", tags: [] });
+  insertVector(db, s3.id, [1, 1]);
+  check("unrelated does not supersede", applySupersession(db, s3.id, "emperor penguins migrate across antarctic ice shelves yearly", "global") === null);
+  // Same text in another scope refreshes the one global-keyed entry (no duplicate);
+  // cross-scope paraphrases must match within their own scope only.
+  const o1 = upsertMemory(db, { text: "staging postgres database runs version fourteen with nightly backups", scope: "project:other", tags: [] });
+  insertVector(db, o1.id, [1, 0]);
+  const o2 = upsertMemory(db, { text: "staging postgres database runs version fourteen with weekly backups", scope: "project:other", tags: [] });
+  insertVector(db, o2.id, [0, 1]);
+  const hitO = applySupersession(db, o2.id, "staging postgres database runs version fourteen with weekly backups", "project:other");
+  check("supersession stays within scope", hitO !== null && hitO.supersededId === o1.id, `got=${hitO ? hitO.supersededId : "none"}`);
+  check("global rows untouched by other-scope retire", getMemory(db, s2.id).superseded_by === null);
+  setPinned(db, s2.id, true);
+  const s5 = upsertMemory(db, { text: "production postgres database runs version fourteen with monthly backups", scope: "global", tags: [] });
+  insertVector(db, s5.id, [1, 0]);
+  const hit2 = applySupersession(db, s5.id, "production postgres database runs version fourteen with monthly backups", "global");
+  check("pin carries to superseding row", hit2 !== null && getMemory(db, s5.id).pinned === true, `got=${hit2 ? hit2.supersededId : "none"}`);
+  const before = getMemory(db, s5.id).confirmed | 0;
+  upsertMemory(db, { text: "production postgres database runs version fourteen with monthly backups", scope: "global", tags: [] });
+  check("identical repeat bumps confirmed", (getMemory(db, s5.id).confirmed | 0) === before + 1);
+  for (const id of [s1.id, s2.id, s3.id, o1.id, o2.id, s5.id]) deleteMemory(db, id);
+  dropKindCache(testDb);
+
   // WAL + single-JOIN loader: parity, scope filter, cache, invalidation.
   check("journal mode is WAL", db.prepare("PRAGMA journal_mode").get().journal_mode === "wal");
   const { loadScoredMemories, dropVectorCache } = await import("../lib/vectors.mjs");
