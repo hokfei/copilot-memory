@@ -43,7 +43,25 @@ const db = openDb(testDb);
 try {
   check("fresh db is empty", countMemories(db) === 0);
 
-  // Pure checks (no model needed): dims validation + secret exclusion.
+  // Quality gate (pure checks, no model needed).
+  {
+    const { classifyKind, looksSecret, headlineTooLong, HEADLINE_CAP } = await import("../lib/quality.mjs");
+    check("classifies standing truth as state", classifyKind("I prefer TypeScript with strict mode") === "state");
+    check("classifies past change as event (was fixed)", classifyKind("The retry bug was fixed in the deploy script") === "event");
+    check("classifies past change as event (has been)", classifyKind("The pipeline has been validated end to end") === "event");
+    check("classifies past change as event (now returns)", classifyKind("The endpoint now returns JSON errors") === "event");
+    check("classifies past change as event (have switched)", classifyKind("We have switched to pnpm") === "event");
+    check("self-report does not override structure", classifyKind("STATE FACT: the deploy was migrated to Docker") === "event");
+    check("rejects api key", looksSecret("the api key for staging is sk-abc123") === true);
+    check("rejects password", looksSecret("my password for the deploy user is hunter2") === true);
+    check("rejects bearer token", looksSecret("use bearer abc.def.ghi for auth") === true);
+    check("rejects credential connection string", looksSecret("postgres://admin:s3cret@db:5432/app") === true);
+    check("rejects PEM block", looksSecret("key: -----BEGIN RSA PRIVATE KEY----- ...") === true);
+    check("allows endpoint docs", looksSecret("the api endpoint uses REST conventions") === false);
+    check("allows plural token prose", looksSecret("we use OAuth tokens for CI") === false);
+    check("headline cap boundary", HEADLINE_CAP === 300 && headlineTooLong("x".repeat(300)) === false);
+    check("headline over cap", headlineTooLong("x".repeat(301)) === true);
+  }
   {
     const q = new Float32Array([1, 0, 0]);
     check("dims match returns null", dimsMismatch([{ vector: new Float32Array([0, 1, 0]) }], q) === null);
