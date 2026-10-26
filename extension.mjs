@@ -1,6 +1,7 @@
 import { joinSession } from "@github/copilot-sdk/extension";
 import { embedQuery, embedDocuments } from "./lib/embed.mjs";
-import { fillMissingVectors } from "./lib/vectors.mjs";
+import { loadScoredMemories } from "./lib/vectors.mjs";
+import { memoryDbPath } from "./lib/paths.mjs";
 import {
   openDb,
   normalizeScope,
@@ -12,7 +13,6 @@ import {
   deleteMemory,
   updateMemoryMeta,
   setPinned,
-  parseTags,
   enforceScopeCap,
   DEFAULT_SCOPE_CAP,
   listMemories,
@@ -116,35 +116,10 @@ const session = await joinSession({
         try {
           if (countMemories(db) === 0) return "No memories stored yet. Use remember_memory to save some.";
           const scopeFilter = args.scope ? normalizeScope(args.scope) : null;
-          const rows = db
-            .prepare(
-              scopeFilter
-                ? "SELECT * FROM memories WHERE scope = ?"
-                : "SELECT * FROM memories"
-            )
-            .all(...(scopeFilter ? [scopeFilter] : []));
-          if (rows.length === 0) {
+          const withVecs = await loadScoredMemories(db, memoryDbPath, scopeFilter);
+          if (withVecs.length === 0) {
             return `No memories in scope '${scopeFilter}'.`;
           }
-          const withVecs = rows.map((r) => {
-            const buf = db
-              .prepare("SELECT vector FROM memory_vectors WHERE id = ?")
-              .get(r.id)?.vector;
-            return {
-              id: r.id,
-              text: r.text,
-              scope: r.scope,
-              tags: parseTags(r.tags),
-                pinned: (r.pinned | 0) === 1,
-                source_session: r.source_session,
-                created_at: r.created_at,
-                updated_at: r.updated_at,
-                vector: buf
-                  ? new Float32Array(buf.buffer, buf.byteOffset, buf.byteLength / 4)
-                  : null,
-              };
-          });
-          await fillMissingVectors(db, withVecs);
           const queryVec = await embedQuery(query);
           const mismatch = dimsMismatch(withVecs, queryVec);
           if (mismatch) {
@@ -190,24 +165,8 @@ const session = await joinSession({
           }
           const query = (args.query || "").trim();
           if (!query) return "Give an id or a query to forget a memory.";
-          const rows = db.prepare("SELECT * FROM memories").all();
-          if (rows.length === 0) return "No memories stored yet.";
-          const withVecs = rows.map((r) => {
-            const buf = db
-              .prepare("SELECT vector FROM memory_vectors WHERE id = ?")
-              .get(r.id)?.vector;
-            return {
-              id: r.id,
-              text: r.text,
-              scope: r.scope,
-              tags: parseTags(r.tags),
-              pinned: (r.pinned | 0) === 1,
-              vector: buf
-                ? new Float32Array(buf.buffer, buf.byteOffset, buf.byteLength / 4)
-                : null,
-            };
-          });
-          await fillMissingVectors(db, withVecs);
+          if (countMemories(db) === 0) return "No memories stored yet.";
+          const withVecs = await loadScoredMemories(db, memoryDbPath);
           const queryVec = await embedQuery(query);
           const mismatch = dimsMismatch(withVecs, queryVec);
           if (mismatch) {
