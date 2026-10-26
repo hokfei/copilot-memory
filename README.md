@@ -75,9 +75,9 @@ embedder and chat model are never resident at the same time (mutual
 
 | Tool | Purpose |
 | ---- | ------- |
-| `remember` | Save a fact/note (`text`, `scope` default global, `tags`, `pin?`). Same text refreshes instead of duplicating; new entries past the 500/scope cap evict oldest unpinned. |
-| `recall` | Semantic search over memories (`query`, `scope?`, `limit?`). Pinned entries rank first. |
-| `forget` | Delete by `id` directly; query form echoes the top match and needs `confirm:true` (two-step). |
+| `remember_memory` | Save a fact/note (`text`, `scope` default global, `tags`, `pin?`). Same text refreshes instead of duplicating; new entries past the 500/scope cap evict oldest unpinned. Renamed from `remember` to avoid collisions with other extensions. |
+| `recall_memory` | Semantic search over memories (`query`, `scope?`, `limit?`). Pinned entries rank first. Renamed from `recall`. |
+| `forget_memory` | Delete by `id` directly; query form echoes the top match and needs `confirm:true` (two-step). Renamed from `forget`. |
 | `pin_memory` | Pin/unpin by `id` (`pinned` default true). Pinned ranks first in recall, exempt from eviction. |
 | `list_memories` | Filterable browse (`scope?`, `tag?`, `limit?`), no embedding. |
 | `consolidate_memories` | On-demand LLM pass: dedupe, merge near-duplicates, flag contradictions. |

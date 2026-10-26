@@ -34,7 +34,7 @@ function formatMemory(m) {
 const session = await joinSession({
   tools: [
     {
-      name: "remember",
+      name: "remember_memory",
       description:
         "Save a fact, preference, decision, or note to long-term memory. Scope defaults to global; use project:<name> for project-specific memories. Re-remembering the same text refreshes the existing entry instead of duplicating it.",
       parameters: {
@@ -89,7 +89,7 @@ const session = await joinSession({
       },
     },
     {
-      name: "recall",
+      name: "recall_memory",
       description:
         "Search long-term memories by meaning. Searches memories only — past session history stays in the session-search extension.",
       parameters: {
@@ -114,7 +114,7 @@ const session = await joinSession({
         if (!query) return "Give a non-empty query to recall memories.";
         const db = openDb();
         try {
-          if (countMemories(db) === 0) return "No memories stored yet. Use remember to save some.";
+          if (countMemories(db) === 0) return "No memories stored yet. Use remember_memory to save some.";
           const scopeFilter = args.scope ? normalizeScope(args.scope) : null;
           const rows = db
             .prepare(
@@ -164,7 +164,7 @@ const session = await joinSession({
       },
     },
     {
-      name: "forget",
+      name: "forget_memory",
       description:
         "Delete a memory by id, or by query (deletes the single top match, only after confirmation).",
       parameters: {
@@ -216,7 +216,7 @@ const session = await joinSession({
           const [top] = searchMemories(withVecs, queryVec, 1);
           if (!top) return "No matching memories found.";
           if (args.confirm !== true) {
-            return `About to forget this memory:\n${formatMemory(top)}\nCall forget again with id '${top.id}' (or query plus confirm:true) to delete it.`;
+            return `About to forget this memory:\n${formatMemory(top)}\nCall forget_memory again with id '${top.id}' (or query plus confirm:true) to delete it.`;
           }
           deleteMemory(db, top.id);
           return `Forgot memory (${top.id}).`;
