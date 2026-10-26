@@ -205,6 +205,46 @@ try {
     migDb.close();
     rmSync(legacyDb, { force: true });
   }
+
+  // WAL + single-JOIN loader: parity, scope filter, cache, invalidation.
+  check("journal mode is WAL", db.prepare("PRAGMA journal_mode").get().journal_mode === "wal");
+  const { loadScoredMemories, dropVectorCache } = await import("../lib/vectors.mjs");
+  dropVectorCache(testDb);
+  const loaded = await loadScoredMemories(db, testDb);
+  check("loader returns all rows", loaded.length === countMemories(db), `got=${loaded.length}`);
+  check(
+    "loader vectors decoded",
+    loaded.every((m) => m.vector instanceof Float32Array && m.vector.length === vecs[0].length)
+  );
+  const loadedScoped = await loadScoredMemories(db, testDb, "project:webapp");
+  check("loader scope filter", loadedScoped.length === 1 && loadedScoped[0].id === ids[1], `got=${loadedScoped.length}`);
+  const parity = getAllVectors(db).map((r) => ({ ...getMemory(db, r.id), vector: r.vector }));
+  const byId = new Map(loaded.map((m) => [m.id, m]));
+  check(
+    "loader parity with per-row path",
+    parity.every((p) => {
+      const l = byId.get(p.id);
+      return (
+        l && l.text === p.text && l.scope === p.scope && l.pinned === p.pinned &&
+        l.vector.length === p.vector.length && l.vector.every((v, i) => v === p.vector[i])
+      );
+    })
+  );
+  const again = await loadScoredMemories(db, testDb);
+  check("cache hit returns same rows", again === loaded);
+  // Simulate a parallel session's write through a second connection.
+  const db2 = openDb(testDb);
+  try {
+    const { id: nid } = upsertMemory(db2, { text: "parallel session probe entry", scope: "global", tags: [] });
+    insertVector(db2, nid, Array.from(vecs[0]));
+  } finally {
+    db2.close();
+  }
+  const after = await loadScoredMemories(db, testDb);
+  check("cache invalidates on external write", after.length === loaded.length + 1, `got=${after.length}`);
+  check("cache refreshes reference", after !== loaded);
+  deleteMemory(db, memoryIdFor("parallel session probe entry"));
+  dropVectorCache(testDb);
 } finally {
   db.close();
   rmSync(testDb, { force: true });
