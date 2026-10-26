@@ -40,6 +40,12 @@ Three mechanics ported from the old keyword-based `opencode-memory-plugin`
   entries. New inserts past the cap evict the oldest **unpinned** entries
   (by `created_at`), vectors included.
 
+`recall_memory`/`forget_memory` share one JOIN loader (`lib/vectors.mjs`):
+memories + vectors in a single query, decoded once, cached in memory keyed
+by the db + `-wal` freshness stamp (WAL commits only touch the sidecar until
+checkpoint). `memory.db` runs in WAL mode with a 5s busy timeout so parallel
+sessions don't hit `SQLITE_BUSY`.
+
 **Split with session-search:** session history search stays in
 `session-search` (`search_sessions`); durable facts the user asked to keep
 live here (`recall`). The two never merge indexes.

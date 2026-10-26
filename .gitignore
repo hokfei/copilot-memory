@@ -1,5 +1,7 @@
 node_modules/
 memory.db
 memory.db-journal
+memory.db-wal
+memory.db-shm
 staging.json
 .test-memory.db*
