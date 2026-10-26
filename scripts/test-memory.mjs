@@ -76,6 +76,46 @@ try {
     check("no candidates is null", findNearDuplicate("we run postgres in prod", []) === null);
   }
 
+  // Miner core: reader, parser, full gate (pure, no model).
+  {
+    const { readCheckpoints, parseExtraction, minerGate, extractionPrompt, EXTRACTION_EXAMPLES } =
+      await import("../lib/miner.mjs");
+    check("reader handles missing store", readCheckpoints("C:/no/such/store.db").length === 0);
+    const { DatabaseSync: DB } = await import("node:sqlite");
+    const { join: joinP } = await import("node:path");
+    const fxDb = joinP(extRoot, ".test-checkpoints.db");
+    rmSync(fxDb, { force: true });
+    {
+      const fx = new DB(fxDb);
+      fx.exec("CREATE TABLE checkpoints (id INTEGER PRIMARY KEY, session_id TEXT, checkpoint_number INTEGER, title TEXT, overview TEXT, history TEXT, work_done TEXT, technical_details TEXT, important_files TEXT, next_steps TEXT, created_at TEXT)");
+      fx.prepare("INSERT INTO checkpoints (session_id, checkpoint_number, title, overview, history, work_done, technical_details) VALUES (?,?,?,?,?,?,?)").run("s1", 1, "t", "ov", "hi", "wd", "td");
+      fx.prepare("INSERT INTO checkpoints (session_id, checkpoint_number, title, overview, history, work_done, technical_details) VALUES (?,?,?,?,?,?,?)").run("s1", 2, "t2", "", "", "only work", "");
+      fx.close();
+    }
+    const cps = readCheckpoints(fxDb);
+    check("reader returns checkpoints oldest-first", cps.length === 2 && cps[0].number === 1 && cps[1].text === "only work");
+    rmSync(fxDb, { force: true });
+    const good = parseExtraction('[{"text": "Production deploys run on Thursdays", "confidence": 0.9, "tags": ["workflow"]}]');
+    check("parser accepts valid array", good.candidates.length === 1 && good.errors.length === 0 && good.candidates[0].confidence === 0.9);
+    check("parser rejects prose", parseExtraction("no json here").errors.length === 1);
+    check("parser flags missing text", parseExtraction("[{}]").errors.length === 1);
+    const prompt = extractionPrompt("some checkpoint");
+    check("prompt embeds good examples", EXTRACTION_EXAMPLES.every((e) => prompt.includes(e)));
+    const gate = (t, c = 0.9, d = "") => minerGate({ text: t, detail: d, confidence: c }, prompt);
+    check("gate passes durable fact", gate("Production incidents page the on-call engineer within five minutes") === null);
+    check("gate rejects short", gate("Too short") !== null);
+    check("gate rejects long", gate("x".repeat(201)) !== null);
+    check("gate rejects low confidence", gate("Production deploys run on Thursdays with a staging gate", 0.5) !== null);
+    check("gate rejects missing confidence", minerGate({ text: "Production deploys run on Thursdays with a staging gate" }, prompt) !== null);
+    check("gate rejects secret", gate("The deploy api key is sk-live-123 for production use") !== null);
+    check("gate rejects transient status", gate("The migration to pnpm is complete and shipped yesterday") !== null);
+    check("gate rejects in-progress", gate("We are currently implementing the new deploy pipeline") !== null);
+    check("gate rejects branch talk", gate("The fix is on branch feat/deploy-pipeline for review") !== null);
+    check("gate rejects narrative", gate("We worked on the deploy pipeline and fixed several bugs") !== null);
+    check("gate rejects dangling subject", gate("The project uses pnpm for package management tasks") !== null);
+    check("gate rejects prompt echo", gate(EXTRACTION_EXAMPLES[0]) !== null);
+  }
+
   // Preload: repo resolution, selection order, budget honesty (no model).
   {
     const { resolveRepo, repoScope, selectPreloadRows, renderPreload, buildPreload, joinWithFallback, MAX_INJECT_CHARS } =
