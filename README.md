@@ -136,6 +136,28 @@ General working context:
 - One line per hook run is appended to `hook-audit.log` (timestamp, cwd, repo,
   injected, withheld, chars) — the only way to know whether a host ran the hook.
 
+## Offline auto-capture (miner)
+
+`scripts/mine.mjs` reads session checkpoint prose from
+`~/.copilot/session-store.db` (already summarised by the cloud model —
+extraction from clean text, never comprehension of raw transcripts), asks the
+local chat model (`SESSION_MEMORY_CHAT_MODEL`) for durable reusable facts as
+JSON, runs every candidate through the full gate
+(`lib/miner.mjs`: 25–200 chars, confidence ≥ 0.7, secret-looking, transient,
+narrative, dangling-subject, prompt-echo), then stages survivors to
+`mined-staging.json` for approval (default). `--auto-import` stores survivors
+at/above `--min-confidence` (default 0.85) directly through the same
+upsert + supersede + cap path as `remember_memory`; `--import` imports a
+staging file. `mined.json` tracks processed `session:checkpoint` ids so
+nothing is reprocessed. On-device: no network, no AI credits.
+
+```bash
+npm run mine -- --limit 25        # stage for approval
+node scripts/mine.mjs --import    # import staged
+node scripts/mine.mjs --auto-import
+npm run schedule-weekly           # OS scheduled task, weekly Sunday 03:00
+```
+
 ## Backfill (one-time, approval-gated)
 
 ```bash
@@ -173,6 +195,8 @@ lib/search.mjs         brute-force dot-product search + per-scope cap
 lib/vectors.mjs        fill missing vectors (shared by recall, forget)
 lib/synthesize.mjs     lazy Qwen3.5-4B chat context, budgeted prompts
 scripts/backfill.mjs   one-time history extraction into staging.json
+scripts/mine.mjs       offline checkpoint miner (stage default, --auto-import)
+scripts/schedule-weekly.mjs  register weekly OS mining task
 scripts/test-memory.mjs    self-consistency tests (throwaway DB)
 memory.db              memories (+ -wal/-shm under WAL, generated, gitignored)
 hook-audit.log         one line per session-start hook run (generated, gitignored)
