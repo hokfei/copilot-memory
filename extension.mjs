@@ -1,8 +1,10 @@
 import { joinSession } from "@github/copilot-sdk/extension";
+import { basename } from "node:path";
 import { embedQuery, embedDocuments } from "./lib/embed.mjs";
 import { loadScoredMemories } from "./lib/vectors.mjs";
 import { looksSecret, headlineTooLong, HEADLINE_CAP } from "./lib/quality.mjs";
-import { memoryDbPath } from "./lib/paths.mjs";
+import { resolveRepo, repoScope, buildPreload, auditHook, joinWithFallback, MAX_INJECT_CHARS } from "./lib/preload.mjs";
+import { memoryDbPath, hookAuditPath } from "./lib/paths.mjs";
 import {
   openDb,
   normalizeScope,
@@ -36,7 +38,7 @@ function formatMemory(m) {
   return `(${m.id}) [${m.scope}]${tags}${pin}${kind}${conf}\n${m.text}${detail}`;
 }
 
-const session = await joinSession({
+const session = await joinWithFallback(joinSession, {
   tools: [
     {
       name: "remember_memory",
@@ -560,6 +562,48 @@ Reply schema: {"merges":[{"keep_id":"...","merge_ids":["..."],"merged_text":"...
       },
     },
   ],
-});
+  },
+  { onSessionStart }
+);
 
 await session.log("memory extension ready", { ephemeral: true });
+
+// Session-start preload: capped known-facts block, sqlite only, never throws.
+// A slow or throwing hook would surface on every session start, so the body
+// is defensive and node-llama-cpp is never loaded on this path.
+async function onSessionStart(input) {
+  const started = Date.now();
+  const cwd = (input && input.workingDirectory) || process.cwd();
+  let repo = basename(cwd);
+  let injected = 0;
+  let withheld = 0;
+  let chars = 0;
+  try {
+    repo = resolveRepo(cwd).repo;
+    const db = openDb();
+    try {
+      const built = buildPreload(db, repo, MAX_INJECT_CHARS);
+      injected = built.injected;
+      withheld = built.withheld;
+      chars = built.text ? built.text.length : 0;
+      if (built.text) return { additionalContext: built.text };
+      return;
+    } finally {
+      db.close();
+    }
+  } catch {
+    return;
+  } finally {
+    auditHook(hookAuditPath, {
+      ts: new Date().toISOString(),
+      cwd,
+      repo,
+      injected,
+      withheld,
+      chars,
+      ms: Date.now() - started,
+    });
+  }
+}
+
+// (joinWithFallback lives in lib/preload.mjs, tested with a stub joinFn.)
