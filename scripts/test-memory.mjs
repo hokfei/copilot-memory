@@ -224,6 +224,50 @@ try {
     rmSync(legacyDb, { force: true });
   }
 
+  // kind/detail: structural auto-classification, round-trip, migration.
+  const { loadScoredMemories: loadKind, dropVectorCache: dropKindCache } = await import("../lib/vectors.mjs");
+  const evId = upsertMemory(db, { text: "the old endpoint was replaced with REST", scope: "global", tags: [] }).id;
+  check("event auto-classified", getMemory(db, evId).kind === "event");
+  check("state auto-classified", getMemory(db, ids[0]).kind === "state");
+  const detId = upsertMemory(db, { text: "detail round trip probe", scope: "global", tags: [], detail: "because reasons" }).id;
+  check("detail stored", getMemory(db, detId).detail === "because reasons");
+  upsertMemory(db, { text: "detail round trip probe", scope: "global", tags: [] });
+  check("detail kept on refresh", getMemory(db, detId).detail === "because reasons");
+  upsertMemory(db, { text: "detail round trip probe", scope: "global", tags: [], detail: "new reasons" });
+  check("detail replaced when given", getMemory(db, detId).detail === "new reasons");
+  check("detail defaults empty", getMemory(db, ids[0]).detail === "");
+  dropKindCache(testDb);
+  const withKind = await loadKind(db, testDb);
+  const evRow = withKind.find((m) => m.id === evId);
+  check(
+    "loader carries kind/detail",
+    evRow && evRow.kind === "event" && withKind.find((m) => m.id === detId).detail === "new reasons"
+  );
+  deleteMemory(db, evId);
+  deleteMemory(db, detId);
+  dropKindCache(testDb);
+
+  // Migration: original schema (no pinned/kind/detail) gains all three.
+  const legacyDb2 = testDb + ".legacy2";
+  rmSync(legacyDb2, { force: true });
+  {
+    const { DatabaseSync } = await import("node:sqlite");
+    const raw = new DatabaseSync(legacyDb2);
+    raw.exec(
+      "CREATE TABLE memories (id TEXT PRIMARY KEY, text TEXT NOT NULL, scope TEXT NOT NULL DEFAULT 'global', tags TEXT NOT NULL DEFAULT '[]', source_session TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL); CREATE TABLE memory_vectors (id TEXT PRIMARY KEY, vector BLOB NOT NULL);"
+    );
+    raw.close();
+  }
+  const migDb2 = openDb(legacyDb2);
+  try {
+    const { id } = upsertMemory(migDb2, { text: "the cache was migrated to disk", scope: "global", tags: [] });
+    const m = getMemory(migDb2, id);
+    check("original schema migrates kind/detail", m.kind === "event" && m.detail === "" && m.pinned === false);
+  } finally {
+    migDb2.close();
+    rmSync(legacyDb2, { force: true });
+  }
+
   // WAL + single-JOIN loader: parity, scope filter, cache, invalidation.
   check("journal mode is WAL", db.prepare("PRAGMA journal_mode").get().journal_mode === "wal");
   const { loadScoredMemories, dropVectorCache } = await import("../lib/vectors.mjs");

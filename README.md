@@ -21,10 +21,19 @@ recall(query) ──embed (same QUERY_PREFIX)──▶ dot product, pinned first
 
 Memories live in `memory.db` (sqlite via `node:sqlite`):
 
-- `memories(id, text, scope, tags JSON, source_session NULL, pinned, created_at, updated_at)`
+- `memories(id, text, scope, tags JSON, source_session NULL, pinned, kind, detail, created_at, updated_at)`
 - `memory_vectors(id, vector BLOB)` — Float32, same dims as the session-search index
 
 Scope is `global` or `project:<project_id|repo>`.
+
+- **kind/detail**: `kind` is `state` (standing truth) or `event` (a past
+  change), always classified structurally from the text — callers cannot set
+  it. Rows without a kind read as state, so migration removes nothing from
+  recall. Headlines cap at 300 chars; reasons/examples/evidence go in
+  `detail`, which is searchable and returned by recall but never preloaded.
+  Events stay searchable but out of the session-start preload (they would
+  otherwise push out the standing truths that change behaviour); pinned rows
+  are always preloadable.
 
 Three mechanics ported from the old keyword-based `opencode-memory-plugin`
 (semantic search here supersedes its keyword matching — only these carry over):
@@ -81,8 +90,8 @@ embedder and chat model are never resident at the same time (mutual
 
 | Tool | Purpose |
 | ---- | ------- |
-| `remember_memory` | Save a fact/note (`text`, `scope` default global, `tags`, `pin?`). Same text refreshes instead of duplicating; new entries past the 500/scope cap evict oldest unpinned. Renamed from `remember` to avoid collisions with other extensions. |
-| `recall_memory` | Semantic search over memories (`query`, `scope?`, `limit?`). Pinned entries rank first. Renamed from `recall`. |
+| `remember_memory` | Save a durable fact (`text` headline max 300 chars, `detail?` for reasons/evidence, `scope` default global, `tags`, `pin?`). Only what stays true in six months — never progress status, branch names, credentials, or repo-readable facts. Secrets rejected. Same text refreshes instead of duplicating; new entries past the 500/scope cap evict oldest unpinned. Past changes auto-classify as events (searchable, not preloaded). Renamed from `remember`. |
+| `recall_memory` | Semantic search over memories (`query`, `scope?`, `limit?`). Pinned entries rank first; returns headline + detail + kind. Renamed from `recall`. |
 | `forget_memory` | Delete by `id` directly; query form echoes the top match and needs `confirm:true` (two-step). Renamed from `forget`. |
 | `pin_memory` | Pin/unpin by `id` (`pinned` default true). Pinned ranks first in recall, exempt from eviction. |
 | `list_memories` | Filterable browse (`scope?`, `tag?`, `limit?`), no embedding. |
