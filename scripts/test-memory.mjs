@@ -43,7 +43,38 @@ const db = openDb(testDb);
 try {
   check("fresh db is empty", countMemories(db) === 0);
 
-  // Quality gate (pure checks, no model needed).
+  // Near-duplicate similarity (pure token math, no model needed).
+  // NOTE: idf is measured over the candidate set, so single-candidate toy
+  // cases underweight shared words; realistic tests use multi-row sets with
+  // shared boilerplate, exactly how the remember path calls it.
+  {
+    const { tokenize, findNearDuplicate, SIMILARITY_THRESHOLD } = await import("../lib/similarity.mjs");
+    check("tokenize filters short words", JSON.stringify(tokenize("We run Postgres 14 in prod!")) === JSON.stringify(["postgres", "prod"]));
+    check("identical texts score 1", findNearDuplicate("we run postgres in prod", [{ id: "a", text: "we run postgres in prod" }]).score === 1);
+    check("disjoint texts score null", findNearDuplicate("penguins huddle in winter", [{ id: "a", text: "we run postgres in prod" }]) === null);
+    const boilerplate = [
+      { id: "a", text: "production postgres database runs version fourteen with nightly backups" },
+      { id: "b", text: "production postgres database stores weekly reports for analytics" },
+      { id: "c", text: "production postgres database cleans temp tables every sunday" },
+    ];
+    const para = findNearDuplicate("production postgres database runs version fourteen with weekly backups", boilerplate);
+    check("close paraphrase picks right row", para !== null && para.id === "a", `got=${para ? para.id + "@" + para.score.toFixed(3) : "none"}`);
+    const contra = findNearDuplicate(
+      "production deploy runs every Tuesday morning with full backup",
+      [
+        { id: "a", text: "production deploy runs every Thursday morning with full backup" },
+        { id: "b", text: "production deploy validates config before starting services" },
+        { id: "c", text: "production deploy notifies the team after finishing migrations" },
+      ]
+    );
+    check("contradiction supersedes", contra !== null && contra.id === "a" && contra.score >= SIMILARITY_THRESHOLD, `got=${contra ? contra.id + "@" + contra.score.toFixed(3) : "none"}`);
+    const swallow = findNearDuplicate("postgres prod", [
+      { id: "a", text: "postgres prod windows scheduled task nightly backup rotation policy quarterly review" },
+    ]);
+    check("short fact not swallowed by long one", swallow === null, `score=${swallow ? swallow.score.toFixed(3) : "none"}`);
+    check("empty query is null", findNearDuplicate("a an of", [{ id: "a", text: "we run postgres in prod" }]) === null);
+    check("no candidates is null", findNearDuplicate("we run postgres in prod", []) === null);
+  }
   {
     const { classifyKind, looksSecret, headlineTooLong, HEADLINE_CAP } = await import("../lib/quality.mjs");
     check("classifies standing truth as state", classifyKind("I prefer TypeScript with strict mode") === "state");
