@@ -1,7 +1,7 @@
 {
   "name": "memory",
   "version": "0.1.0",
-  "description": "Local, private global memory for the Copilot app (remember/recall/forget)",
+  "description": "Local, private global memory for the Copilot app (remember_memory/recall_memory/forget_memory)",
   "type": "module",
   "license": "MIT",
   "author": "hokfei",

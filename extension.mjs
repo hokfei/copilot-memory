@@ -442,7 +442,7 @@ Reply schema: {"merges":[{"keep_id":"...","merge_ids":["..."],"merged_text":"...
     {
       name: "bootstrap_instructions",
       description:
-        "Draft a muse-instructions.md for a project from its project-scoped memories plus top session-history hits. Returns draft text only — never writes into repos.",
+        "Draft a copilot-instructions.md for a project from its project-scoped memories plus top session-history hits. Returns draft text only — never writes into repos.",
       parameters: {
         type: "object",
         properties: {
@@ -513,9 +513,9 @@ Reply schema: {"merges":[{"keep_id":"...","merge_ids":["..."],"merged_text":"...
 
         const { runChat } = await import("./lib/synthesize.mjs");
         const systemPrompt =
-          "You write concise, practical muse-instructions.md drafts for software projects. Reply with only the draft markdown, no preamble.";
+          "You write concise, practical copilot-instructions.md drafts for software projects. Reply with only the draft markdown, no preamble.";
         const userPrompt =
-          `Draft a muse-instructions.md for the "${project}" project from the material below. ` +
+          `Draft a copilot-instructions.md for the "${project}" project from the material below. ` +
           `Keep it short: conventions, key decisions, workflow notes. Mark anything uncertain with "(verify)".`;
         const items = [
           ...mems.map((m) => `MEMORY: ${m.text}`),
@@ -524,7 +524,7 @@ Reply schema: {"merges":[{"keep_id":"...","merge_ids":["..."],"merged_text":"...
         try {
           const { reply } = await runChat(systemPrompt, userPrompt, items);
           return (
-            `Draft muse-instructions.md for "${project}" (from ${mems.length} memories, ` +
+            `Draft copilot-instructions.md for "${project}" (from ${mems.length} memories, ` +
             `${sessionHits.length} session hits — review before using, nothing was written to any repo):\n\n${reply}`
           );
         } catch (err) {
