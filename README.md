@@ -155,7 +155,7 @@ nothing is reprocessed. On-device: no network, no AI credits.
 npm run mine -- --limit 25        # stage for approval
 node scripts/mine.mjs --import    # import staged
 node scripts/mine.mjs --auto-import
-npm run schedule-weekly           # OS scheduled task, weekly Sunday 03:00
+npm run schedule                  # OS scheduled task, every 3h
 ```
 
 ## Evaluation
@@ -210,7 +210,7 @@ lib/vectors.mjs        fill missing vectors (shared by recall, forget)
 lib/synthesize.mjs     lazy Qwen3.5-4B chat context, budgeted prompts
 scripts/backfill.mjs   one-time history extraction into staging.json
 scripts/mine.mjs       offline checkpoint miner (stage default, --auto-import)
-scripts/schedule-weekly.mjs  register weekly OS mining task
+scripts/schedule-weekly.mjs  register 3-hourly OS mining task
 scripts/eval-recall.mjs    recall@3 over 24 questions + hook latency (eval, not a gate)
 scripts/test-memory.mjs    self-consistency tests (throwaway DB)
 memory.db              memories (+ -wal/-shm under WAL, generated, gitignored)
