@@ -44,7 +44,9 @@ const session = await joinWithFallback(joinSession, {
       name: "remember_memory",
       description:
         "Save a durable fact to long-term memory — only what will still be true in six months " +
-        "(conventions, environments, decisions, ownership, recurring pitfalls). Do NOT store " +
+        "(conventions, environments, decisions, ownership, recurring pitfalls). Call this when the user " +
+        "uses durability phrasing: 'remember X', 'from now on', 'always/never …', 'don't forget', " +
+        "'keep in mind', 'make it a rule'. Do NOT store " +
         "progress/task/review status, branch names, credentials, or anything readable from the repo. " +
         "Headline `text` is capped at 300 chars; put reasons, examples, and evidence in `detail` " +
         "(searchable and returned by recall, never preloaded). Past changes are auto-classified " +
