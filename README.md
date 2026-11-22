@@ -51,7 +51,11 @@ Three mechanics ported from the old keyword-based `opencode-memory-plugin`
   On a hit the old row is retired (`superseded_by` = new id — kept for audit,
   hidden from recall/list/preload/caps), pin carries forward, and the new row
   records `supersedes`. Identical normalized text instead bumps a `confirmed`
-  counter (shown as `×N`). Unrelated facts, cross-scope paraphrases, and short
+  counter (shown as `×N`) — unless that text was retired: explicit
+  `remember_memory` re-activates the old row and retires the newer wording
+  (same-scope head only; reported in the reply). Bulk imports
+  (`mine --auto-import`, `backfill --import`) never re-activate hidden rows.
+  Unrelated facts, cross-scope paraphrases, and short
   facts contained in long ones do not merge.
 - **Per-scope caps**: each scope holds at most `DEFAULT_SCOPE_CAP` (500)
   entries. New inserts past the cap evict the oldest **unpinned** entries

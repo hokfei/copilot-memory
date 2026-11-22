@@ -97,7 +97,7 @@ const session = await joinWithFallback(joinSession, {
         const vec = (await embedDocuments([text]))[0];
         const db = openDb();
         try {
-          const { id, created } = upsertMemory(db, {
+          const { id, created, revived, retiredId } = upsertMemory(db, {
             text,
             scope,
             tags,
@@ -107,7 +107,8 @@ const session = await joinWithFallback(joinSession, {
           insertVector(db, id, vec);
           if (!created) {
             const conf = getMemory(db, id)?.confirmed ?? 1;
-            return `Confirmed existing memory (${id}) [${scope}] — recorded ${conf} time${conf === 1 ? "" : "s"}; no duplicate created.`;
+            const reviveNote = revived ? ` Re-activated hidden memory; retired newer wording (${retiredId}).` : "";
+            return `Confirmed existing memory (${id}) [${scope}] — recorded ${conf} time${conf === 1 ? "" : "s"}; no duplicate created.${reviveNote}`;
           }
           const sup = applySupersession(db, id, text, scope);
           const supNote = sup
@@ -292,7 +293,7 @@ Reply schema: {"merges":[{"keep_id":"...","merge_ids":["..."],"merged_text":"...
           ({ reply } = await runChat(
             systemPrompt,
             userPrompt,
-            mems.map((m) => `(${m.id}) ${m.text}`)
+            mems.map((m) => `(${m.id}) ${m.text}${m.detail ? ` — ${m.detail.slice(0, 500)}` : ""}`)
           ));
         } catch (err) {
           return `Consolidation failed to run the local model: ${err.message}`;
@@ -366,7 +367,10 @@ Reply schema: {"merges":[{"keep_id":"...","merge_ids":["..."],"merged_text":"...
           const tags = [...new Set([...keep.tags, ...absorbed.flatMap((id) => byId.get(id)?.tags ?? [])])];
           const absorbedSession = absorbed.map((id) => byId.get(id)?.source_session).find(Boolean) ?? null;
           const pin = keep.pinned || absorbed.some((id) => byId.get(id)?.pinned);
-          ops.push({ keep, absorbed, text, vec, tags, absorbedSession, pin });
+          const detail = [keep.detail, ...absorbed.map((id) => byId.get(id)?.detail)].filter((d) => typeof d === "string" && d.trim()).join("\n\n") || null;
+          const confirmed = (keep.confirmed | 0) + absorbed.reduce((n, id) => n + ((byId.get(id)?.confirmed | 0) || 0), 0);
+          const created_at = [keep.created_at, ...absorbed.map((id) => byId.get(id)?.created_at)].filter(Boolean).sort()[0] ?? null;
+          ops.push({ keep, absorbed, text, vec, tags, absorbedSession, pin, detail, confirmed, created_at });
         }
         const remap = new Map(); // old keep id -> new content-hash id
         const db2 = openDb();
@@ -374,6 +378,10 @@ Reply schema: {"merges":[{"keep_id":"...","merge_ids":["..."],"merged_text":"...
           db2.exec("BEGIN");
           try {
             for (const op of ops) {
+              if (op.text && memoryIdFor(op.text) === op.keep.id && op.absorbed.length === 0) {
+                warnings.push(`skip merge into ${op.keep.id}: merged_text identical to keep`);
+                continue;
+              }
               if (op.text) {
                 const dupe = getMemory(db2, memoryIdFor(op.text));
                 if (dupe && dupe.id !== op.keep.id && !op.absorbed.includes(dupe.id)) {
@@ -386,7 +394,7 @@ Reply schema: {"merges":[{"keep_id":"...","merge_ids":["..."],"merged_text":"...
                 applied.push(`merged ${id} into ${op.keep.id}`);
               }
               let survivor = op.keep.id;
-              if (op.text) {
+              if (op.text && memoryIdFor(op.text) !== op.keep.id) {
                 deleteMemory(db2, op.keep.id);
                 const { id: newId } = upsertMemory(db2, {
                   text: op.text,
@@ -394,7 +402,9 @@ Reply schema: {"merges":[{"keep_id":"...","merge_ids":["..."],"merged_text":"...
                   tags: op.tags,
                   sourceSession: op.keep.source_session ?? op.absorbedSession,
                   pin: op.pin,
+                  detail: op.detail,
                 });
+                db2.prepare("UPDATE memories SET confirmed = ?, created_at = ? WHERE id = ?").run(op.confirmed || 0, op.created_at || new Date().toISOString(), newId);
                 insertVector(db2, newId, op.vec);
                 remap.set(op.keep.id, newId);
                 survivor = newId;
@@ -405,6 +415,12 @@ Reply schema: {"merges":[{"keep_id":"...","merge_ids":["..."],"merged_text":"...
                   sourceSession: op.absorbedSession,
                   pin: op.pin,
                 });
+                db2.prepare("UPDATE memories SET detail = ?, confirmed = ?, created_at = ? WHERE id = ?").run(
+                  op.detail || "",
+                  op.confirmed || 0,
+                  op.created_at || op.keep.created_at,
+                  op.keep.id
+                );
               }
               for (const id of op.absorbed) remap.set(id, survivor);
             }

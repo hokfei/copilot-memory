@@ -13,6 +13,7 @@
 //   node scripts/mine.mjs [--limit N] [--auto-import] [--min-confidence X]
 //   node scripts/mine.mjs --import [mined-staging.json]
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
+import { pathToFileURL } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 import {
   extRoot,
@@ -28,6 +29,7 @@ import {
   MIN_CONFIDENCE,
 } from "../lib/miner.mjs";
 import { repoScope } from "../lib/preload.mjs";
+import { looksSecret, headlineTooLong } from "../lib/quality.mjs";
 import {
   openDb,
   normalizeScope,
@@ -126,15 +128,30 @@ async function runMine({ limit = 25, autoImport = false, minConfidence = 0.85 })
     processed.add(`${cp.sessionId}:${cp.number}`);
   }
   await disposeChat().catch(() => {});
-  saveState(processed);
   if (autoImport) {
     const { imported, gated } = await importStaged(staged, minConfidence);
+    saveState(processed);
     console.log(`mined: ${staged.length} survivors, ${imported} auto-imported (>= ${minConfidence}), ${gated} held`);
   } else {
-    const prev = existsSync(minedStagingPath)
-      ? JSON.parse(readFileSync(minedStagingPath, "utf8"))
-      : [];
+    let prev = [];
+    if (existsSync(minedStagingPath)) {
+      let parsed;
+      try {
+        parsed = JSON.parse(readFileSync(minedStagingPath, "utf8"));
+      } catch {
+        console.error(`staging file corrupt, not overwriting: ${minedStagingPath}`);
+        process.exitCode = 1;
+        return;
+      }
+      if (!Array.isArray(parsed)) {
+        console.error(`staging file invalid (not an array), not overwriting: ${minedStagingPath}`);
+        process.exitCode = 1;
+        return;
+      }
+      prev = parsed;
+    }
     writeFileSync(minedStagingPath, JSON.stringify([...prev, ...staged], null, 1), "utf8");
+    saveState(processed);
     console.log(`mined: ${staged.length} survivors staged -> ${minedStagingPath} (review, then --import)`);
   }
   if (Object.keys(skipped).length > 0) {
@@ -143,7 +160,16 @@ async function runMine({ limit = 25, autoImport = false, minConfidence = 0.85 })
 }
 
 export async function importStaged(items, minConfidence = 0) {
-  const eligible = items.filter((it) => (it.confidence ?? 1) >= minConfidence);
+  const confident = items.filter((it) => (it.confidence ?? 1) >= minConfidence);
+  const eligible = [];
+  for (const it of confident) {
+    const text = typeof it.text === "string" ? it.text.trim() : "";
+    const detail = typeof it.detail === "string" ? it.detail : "";
+    if (!text || looksSecret(text) || (detail && looksSecret(detail)) || headlineTooLong(text)) {
+      continue;
+    }
+    eligible.push(it);
+  }
   const gated = items.length - eligible.length;
   if (eligible.length === 0) return { imported: 0, gated };
   const vecs = await embedDocuments(eligible.map((it) => it.text));
@@ -156,6 +182,7 @@ export async function importStaged(items, minConfidence = 0) {
         tags: Array.isArray(it.tags) ? it.tags : [],
         sourceSession: it.source_session || null,
         detail: it.detail || null,
+        revive: false,
       });
       insertVector(db, id, vecs[i]);
       applySupersession(db, id, it.text, it.scope || "global");
@@ -180,8 +207,8 @@ async function runImport(file) {
     process.exitCode = 1;
     return;
   }
-  const { imported } = await importStaged(items, 0);
-  console.log(`imported ${imported} memories from ${file}`);
+  const { imported, gated } = await importStaged(items, 0);
+  console.log(`imported ${imported} memories from ${file}${gated ? ` (${gated} gated)` : ""}`);
 }
 
 async function main() {
@@ -207,7 +234,9 @@ async function main() {
   });
 }
 
-main().catch((err) => {
-  console.error(`mine failed: ${err.message}`);
-  process.exitCode = 1;
-});
+if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
+  main().catch((err) => {
+    console.error(`mine failed: ${err.message}`);
+    process.exitCode = 1;
+  });
+}

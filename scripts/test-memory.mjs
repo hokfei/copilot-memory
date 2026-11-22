@@ -457,6 +457,117 @@ try {
   for (const id of [s1.id, s2.id, s3.id, o1.id, o2.id, s5.id]) deleteMemory(db, id);
   dropKindCache(testDb);
 
+  // Un-retire: re-upserting retired text swaps active to the old row and
+  // retires the replacement (single-active, audit preserved).
+  {
+    const u1 = upsertMemory(db, { text: "production postgres database runs version fourteen with nightly backups", scope: "global", tags: [] });
+    insertVector(db, u1.id, [1, 0]);
+    const u2 = upsertMemory(db, { text: "production postgres database runs version fourteen with weekly backups", scope: "global", tags: [] });
+    insertVector(db, u2.id, [0, 1]);
+    const uhit = applySupersession(db, u2.id, "production postgres database runs version fourteen with weekly backups", "global");
+    check("un-retire setup retired", uhit !== null && getMemory(db, u1.id).superseded_by === u2.id);
+    upsertMemory(db, { text: "production postgres database runs version fourteen with nightly backups", scope: "global", tags: [] });
+    check("un-retire clears superseded_by on old row", getMemory(db, u1.id).superseded_by === null);
+    check("un-retire retires replacement with pointer to revived", getMemory(db, u2.id).superseded_by === u1.id);
+    check("un-retire revived row supersedes replacement", getMemory(db, u1.id).supersedes === u2.id);
+    check("un-retire revived row is listed", listMemories(db, {}).some((m) => m.id === u1.id));
+    check("un-retire replacement hidden from list", listMemories(db, {}).every((m) => m.id !== u2.id));
+    for (const id of [u1.id, u2.id]) deleteMemory(db, id);
+    dropKindCache(testDb);
+  }
+
+  // Absorb-only merge persistence: drives the real consolidate no-rewrite
+  // branch in extension.mjs (updateMemoryMeta + detail/confirmed/created_at)
+  // with merge_ids and no merged_text. Test-only seam: the persistence
+  // statements are extracted verbatim from extension.mjs source and executed,
+  // so this test fails if that branch is deleted or drifts. No model/network.
+  {
+    const { readFileSync } = await import("node:fs");
+    const { updateMemoryMeta } = await import("../lib/store.mjs");
+    const extSrc = readFileSync(new URL("../extension.mjs", import.meta.url), "utf8").replace(/\r\n/g, "\n");
+    const persistMarker = "updateMemoryMeta(db2, op.keep.id,";
+    const persistAt = extSrc.indexOf(persistMarker);
+    check("consolidate absorb-only branch present", persistAt !== -1);
+    const guardAt = extSrc.indexOf("if (op.text && memoryIdFor(op.text)");
+    check("consolidate rewrite guard present", guardAt !== -1 && guardAt < persistAt);
+    const elseAt = extSrc.lastIndexOf("} else {", persistAt);
+    check("absorb persistence sits in no-rewrite else", elseAt !== -1 && elseAt > guardAt);
+    const tailMarker = "op.keep.id\n                );";
+    const tailAt = persistAt !== -1 ? extSrc.indexOf(tailMarker, persistAt) : -1;
+    check("absorb persistence snippet extracted", tailAt !== -1);
+    const absorbSnippet = tailAt !== -1 ? extSrc.slice(persistAt, tailAt + tailMarker.length) : "";
+    check(
+      "absorb snippet is the real persistence path",
+      absorbSnippet.includes("UPDATE memories SET detail = ?, confirmed = ?, created_at = ?")
+    );
+    const keepId = upsertMemory(db, { text: "absorb keeper standing fact alpha", scope: "global", tags: ["keep-tag"], detail: "keeper detail" }).id;
+    const absId = upsertMemory(db, { text: "absorb absorbed standing fact beta", scope: "global", tags: ["abs-tag"], sourceSession: "sess-1", detail: "absorbed detail" }).id;
+    setPinned(db, absId, true);
+    db.prepare("UPDATE memories SET confirmed = ?, created_at = ? WHERE id = ?").run(2, "2021-05-01T00:00:00.000Z", keepId);
+    db.prepare("UPDATE memories SET confirmed = ?, created_at = ? WHERE id = ?").run(3, "2020-01-01T00:00:00.000Z", absId);
+    // Simulate consolidate plan validation for an absorb-only merge:
+    // merge_ids present, merged_text absent (no rewrite, so no embedding).
+    const keepRow = getMemory(db, keepId);
+    const absRow = getMemory(db, absId);
+    const rowsById = new Map([[keepRow.id, keepRow], [absRow.id, absRow]]);
+    const merge = { keep_id: keepId, merge_ids: [absId] };
+    const mergeIds = Array.isArray(merge.merge_ids) ? merge.merge_ids : [];
+    const absorbed = mergeIds.filter((id) => typeof id === "string" && rowsById.has(id) && id !== merge.keep_id);
+    const text = typeof merge.merged_text === "string" ? merge.merged_text.trim() : "";
+    check("absorb-only plan has absorbed rows and no rewrite text", absorbed.length === 1 && text === "");
+    const keep = rowsById.get(merge.keep_id);
+    const tags = [...new Set([...keep.tags, ...absorbed.flatMap((id) => rowsById.get(id)?.tags ?? [])])];
+    const absorbedSession = absorbed.map((id) => rowsById.get(id)?.source_session).find(Boolean) ?? null;
+    const pin = keep.pinned || absorbed.some((id) => rowsById.get(id)?.pinned);
+    const detail = [keep.detail, ...absorbed.map((id) => rowsById.get(id)?.detail)].filter((d) => typeof d === "string" && d.trim()).join("\n\n").slice(0, 2000) || null;
+    const confirmed = (keep.confirmed | 0) + absorbed.reduce((n, id) => n + ((rowsById.get(id)?.confirmed | 0) || 0), 0);
+    const created_at = [keep.created_at, ...absorbed.map((id) => rowsById.get(id)?.created_at)].filter(Boolean).sort()[0] ?? null;
+    const op = { keep, absorbed, text, vec: null, tags, absorbedSession, pin, detail, confirmed, created_at };
+    if (tailAt !== -1) {
+      const runAbsorbPersist = new Function("db2", "op", "updateMemoryMeta", absorbSnippet);
+      runAbsorbPersist(db, op, updateMemoryMeta);
+      deleteMemory(db, absId);
+    }
+    const survivor = getMemory(db, keepId);
+    check("absorb keeps union tags", JSON.stringify(survivor.tags) === JSON.stringify(["keep-tag", "abs-tag"]));
+    check("absorb carries session", survivor.source_session === "sess-1");
+    check("absorb carries pin", survivor.pinned === true);
+    check("absorb keeps joined detail", survivor.detail === "keeper detail\n\nabsorbed detail");
+    check("absorb sums confirmed", (survivor.confirmed | 0) === 5);
+    check("absorb keeps earliest created_at", survivor.created_at === "2020-01-01T00:00:00.000Z");
+    deleteMemory(db, keepId);
+    dropKindCache(testDb);
+  }
+
+  // prepareImportItems (backfill): only secret-looking items are skipped; long text is kept.
+  {
+    const secPrep = prepareImportItems([
+      { text: "legit standing preference for testing", scope: "global", tags: [] },
+      { text: "the api key for staging is sk-abc123 rotation note", scope: "global" },
+      { text: "x".repeat(301), scope: "global" },
+    ]);
+    check("prepareImportItems stages legit and long text", secPrep.staged.length === 2);
+    check("prepareImportItems keeps legit item", secPrep.staged[0] && secPrep.staged[0].text === "legit standing preference for testing");
+    check("prepareImportItems keeps long text", secPrep.staged[1] && secPrep.staged[1].text.length === 301);
+    check("prepareImportItems counts only secret as skipped", secPrep.skipped === 1, `skipped=${secPrep.skipped}`);
+  }
+
+  // importStaged (mine): secret/cap filter runs before any embedding, so an
+  // all-gated batch resolves with no model/network touched.
+  {
+    const { importStaged } = await import("./mine.mjs");
+    const gated = await importStaged(
+      [
+        { text: "the api key for staging is sk-abc123 rotation note", scope: "global", tags: [], confidence: 0.9 },
+        { text: "x".repeat(301), scope: "global", tags: [], confidence: 0.9 },
+        { text: "miner detail secret probe", scope: "global", tags: [], detail: "my password for the deploy user is hunter2", confidence: 0.9 },
+      ],
+      0
+    );
+    check("importStaged secret/cap imports nothing", gated.imported === 0);
+    check("importStaged secret/cap counts gated", gated.gated === 3, `gated=${gated.gated}`);
+  }
+
   // WAL + single-JOIN loader: parity, scope filter, cache, invalidation.
   check("journal mode is WAL", db.prepare("PRAGMA journal_mode").get().journal_mode === "wal");
   const { loadScoredMemories, dropVectorCache } = await import("../lib/vectors.mjs");

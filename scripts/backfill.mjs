@@ -13,6 +13,7 @@ import { readAllDocs } from "../lib/read.mjs";
 import { chunkText, sha1 } from "../lib/chunk.mjs";
 import { stagingPath } from "../lib/paths.mjs";
 import { openDb, normalizeScope, isValidScope, insertMemory, insertVector } from "../lib/store.mjs";
+import { looksSecret } from "../lib/quality.mjs";
 import { embedDocuments, disposeEmbedder } from "../lib/embed.mjs";
 
 // Heuristic signals that a chunk states something worth remembering.
@@ -128,6 +129,8 @@ export function prepareImportItems(items) {
   let skipped = 0;
   for (const it of items) {
     if (!it || typeof it.text !== "string" || !it.text.trim()) { skipped++; continue; }
+    const text = it.text.trim();
+    if (looksSecret(text)) { skipped++; continue; }
     const scope = normalizeScope(it.scope || "global");
     if (!isValidScope(scope)) {
       console.error(`skipping item with invalid scope '${it.scope}'`);
@@ -135,7 +138,7 @@ export function prepareImportItems(items) {
       continue;
     }
     staged.push({
-      text: it.text.trim(),
+      text,
       scope,
       tags: Array.isArray(it.tags)
         ? it.tags.filter((t) => typeof t === "string" && t.trim()).map((t) => t.trim())
@@ -185,6 +188,7 @@ async function runImport(file) {
         scope: it.scope,
         tags: it.tags,
         sourceSession: it.sourceSession,
+        revive: false,
       });
       insertVector(db, id, vecs[i]);
     });
